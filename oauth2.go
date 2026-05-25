@@ -44,6 +44,13 @@ type Config struct {
 	UserInfoClaimStrategy                  UserInfoClaimStrategy
 	EnableRFC7591DynamicClientRegistration bool
 	EnableRFC9728ProtectedResourceMetadata bool
+
+	// MasterKeyProvider supplies the at-rest encryption master key for
+	// envelope-encrypting OAuth2 key material in _params. If nil, the
+	// DefaultMasterKeyProvider (reads OAUTH2_MASTER_KEY env) is used.
+	// When the provider returns a nil master, encryption is disabled
+	// and values are stored in legacy plaintext form (dev / back-compat).
+	MasterKeyProvider MasterKeyProvider
 }
 
 func GetOAuth2Config(app core.App) *Config {
