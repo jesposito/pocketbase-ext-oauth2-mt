@@ -18,9 +18,15 @@ func init() {
 	xpb.Register(&Plugin{
 		PathPrefix:     "/oauth2",
 		UserCollection: "users",
-		EnableRFC7591:  true,
-		EnableRFC9728:  true,
-		EnforcePKCE:    "none",
+		// RFC 7591 Dynamic Client Registration defaults to OFF: when on,
+		// the /oauth2/register endpoint is reachable by anyone on the
+		// network and only Initial Access Tokens or admin auth guard it
+		// (see pocketbase-ext-oauth2-mt#3nl). Operators that need DCR
+		// must explicitly enable it AND provision an Initial Access
+		// Token list via Config.DynamicClientRegistrationInitialAccessTokens.
+		EnableRFC7591: false,
+		EnableRFC9728: true,
+		EnforcePKCE:   "none",
 	})
 }
 

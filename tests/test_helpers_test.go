@@ -46,6 +46,7 @@ func setupTestApp(t testing.TB) *tests.TestApp {
 		PathPrefix:                             "/oauth2",
 		UserCollection:                         testUserCollection,
 		EnableRFC7591DynamicClientRegistration: true,
+		AllowUnauthenticatedDynamicClientRegistration: true,
 		EnableRFC9728ProtectedResourceMetadata: true,
 	})
 	if err != nil {

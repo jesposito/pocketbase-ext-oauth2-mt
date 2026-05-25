@@ -2,12 +2,13 @@ package oauth2
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/compose"
 	fositeoauth2 "github.com/ory/fosite/handler/oauth2"
-	"fmt"
 	"github.com/pocketbase/pocketbase/core"
 )
 
@@ -58,9 +59,29 @@ func (s *PocketBaseStrategy) GenerateAccessToken(ctx context.Context, requester 
 }
 
 // ValidateAccessToken implements [oauth2.CoreStrategy].
+//
+// Two checks: (1) the PB native JWT must validate (cryptographic + expiry),
+// and (2) the corresponding _oauth2Access session row must still exist.
+// The second check is what makes /oauth2/revoke actually effective for
+// callers that reach this function (fosite introspection + the local
+// RequireScope middleware). PB-native routes that use apis.RequireAuth()
+// bypass this entirely — wire RevokedTokenGuard() on those routes when
+// you need revocation to take effect there too.
 func (s *PocketBaseStrategy) ValidateAccessToken(ctx context.Context, requester fosite.Requester, token string) error {
-	_, err := s.App.FindAuthRecordByToken(token, core.TokenTypeAuth)
-	return err
+	if _, err := s.App.FindAuthRecordByToken(token, core.TokenTypeAuth); err != nil {
+		return err
+	}
+	signature := s.AccessTokenSignature(ctx, token)
+	if signature == "" {
+		return fosite.ErrInvalidTokenFormat
+	}
+	if _, err := findSessionModelBySignature(s.App, &AccessTokenModel{}, signature); err != nil {
+		if errors.Is(err, fosite.ErrNotFound) {
+			return fosite.ErrInactiveToken
+		}
+		return err
+	}
+	return nil
 }
 
 // REFRESH TOKEN

@@ -2,9 +2,12 @@ package oauth2
 
 import (
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
+	oauth2 "github.com/jesposito/pocketbase-ext-oauth2-mt"
+	"github.com/ory/fosite"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
 )
@@ -368,6 +371,130 @@ func TestAuthEndpoint_MissingClientID(t *testing.T) {
 		},
 	}
 	scenario.Test(t)
+}
+
+// TestRegister_RequiresIAT_When_Configured locks in the 3nl gate: when
+// Config.DynamicClientRegistrationInitialAccessTokens is set, /register
+// rejects requests missing or carrying a wrong bearer token with 401.
+func TestRegister_RequiresIAT_When_Configured(t *testing.T) {
+	const iat = "test-initial-access-token-xyz"
+
+	setupApp := func(t testing.TB) *tests.TestApp {
+		t.Helper()
+		tempDir, err := os.MkdirTemp("", "pb_oauth2_iat_*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		testApp, err := tests.NewTestApp(tempDir)
+		if err != nil {
+			os.RemoveAll(tempDir)
+			t.Fatal(err)
+		}
+		if err := oauth2.Register(testApp, &oauth2.Config{
+			BaseConfig: &fosite.Config{
+				ScopeStrategy:            fosite.ExactScopeStrategy,
+				AudienceMatchingStrategy: fosite.DefaultAudienceMatchingStrategy,
+			},
+			PathPrefix:                                   "/oauth2",
+			UserCollection:                               testUserCollection,
+			EnableRFC7591DynamicClientRegistration:       true,
+			DynamicClientRegistrationInitialAccessTokens: []string{iat},
+		}); err != nil {
+			testApp.Cleanup()
+			t.Fatal(err)
+		}
+		return testApp
+	}
+
+	t.Run("no_token_returns_401", func(t *testing.T) {
+		scenario := tests.ApiScenario{
+			Name:            "register without IAT is 401",
+			Method:          http.MethodPost,
+			URL:             "/oauth2/register",
+			Body:            strings.NewReader(`{"redirect_uris":["https://rp.example.com/cb"]}`),
+			Headers:         map[string]string{"Content-Type": "application/json"},
+			ExpectedStatus:  http.StatusUnauthorized,
+			ExpectedContent: []string{"Invalid_token"},
+			TestAppFactory:  setupApp,
+		}
+		scenario.Test(t)
+	})
+
+	t.Run("wrong_token_returns_401", func(t *testing.T) {
+		scenario := tests.ApiScenario{
+			Name:   "register with wrong IAT is 401",
+			Method: http.MethodPost,
+			URL:    "/oauth2/register",
+			Body:   strings.NewReader(`{"redirect_uris":["https://rp.example.com/cb"]}`),
+			Headers: map[string]string{
+				"Content-Type":  "application/json",
+				"Authorization": "Bearer not-the-right-token",
+			},
+			ExpectedStatus:  http.StatusUnauthorized,
+			ExpectedContent: []string{"Invalid_token"},
+			TestAppFactory:  setupApp,
+		}
+		scenario.Test(t)
+	})
+
+	t.Run("valid_token_allows_registration", func(t *testing.T) {
+		scenario := tests.ApiScenario{
+			Name:   "register with valid IAT succeeds",
+			Method: http.MethodPost,
+			URL:    "/oauth2/register",
+			Body:   strings.NewReader(`{"redirect_uris":["https://rp.example.com/cb"],"client_name":"iat-test","grant_types":["authorization_code"],"response_types":["code"],"token_endpoint_auth_method":"client_secret_post"}`),
+			Headers: map[string]string{
+				"Content-Type":  "application/json",
+				"Authorization": "Bearer " + iat,
+			},
+			ExpectedStatus:  http.StatusCreated,
+			ExpectedContent: []string{"client_id"},
+			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+				seedUsersCollection(t, app)
+			},
+			TestAppFactory: setupApp,
+		}
+		scenario.Test(t)
+	})
+}
+
+// TestRegister_RejectsUnsafeRedirectURIs locks in the redirect-URI policy.
+func TestRegister_RejectsUnsafeRedirectURIs(t *testing.T) {
+	cases := []struct {
+		name       string
+		uri        string
+		ok         bool
+		bodyMatch  string
+	}{
+		{"https_ok", "https://rp.example.com/cb", true, "client_id"},
+		{"loopback_http_ok", "http://localhost:8080/cb", true, "client_id"},
+		{"loopback_ipv4_ok", "http://127.0.0.1:8080/cb", true, "client_id"},
+		{"plain_http_rejected", "http://rp.example.com/cb", false, "must use https"},
+		{"with_fragment_rejected", "https://rp.example.com/cb#x", false, "must not contain a fragment"},
+		{"non_absolute_rejected", "/cb", false, "must be an absolute URI"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"redirect_uris":["` + tc.uri + `"],"client_name":"x","grant_types":["authorization_code"],"response_types":["code"],"token_endpoint_auth_method":"client_secret_post"}`
+			want := http.StatusCreated
+			if !tc.ok {
+				want = http.StatusBadRequest
+			}
+			scenario := tests.ApiScenario{
+				Method:          http.MethodPost,
+				URL:             "/oauth2/register",
+				Body:            strings.NewReader(body),
+				Headers:         map[string]string{"Content-Type": "application/json"},
+				ExpectedStatus:  want,
+				ExpectedContent: []string{tc.bodyMatch},
+				BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+					seedUsersCollection(t, app)
+				},
+				TestAppFactory: setupTestAppForScenario,
+			}
+			scenario.Test(t)
+		})
+	}
 }
 
 func TestLoginUI_Served(t *testing.T) {

@@ -2,6 +2,7 @@ package oauth2
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -108,10 +109,56 @@ func TestAccessTokenValidate(t *testing.T) {
 		t.Fatalf("GenerateAccessToken failed: %v", err)
 	}
 
+	// ValidateAccessToken now also requires an _oauth2Access row to exist
+	// (wg6 revocation enforcement). Seed it so the test exercises the
+	// happy path; a TestAccessTokenValidate_Revoked variant below covers
+	// the negative case.
+	seedTestClient(t, app)
+	seedAccessTokenRow(t, app, token, "openid")
+
 	// Valid token should pass
 	err = strategy.ValidateAccessToken(context.Background(), req, token)
 	if err != nil {
 		t.Errorf("ValidateAccessToken failed for valid token: %v", err)
+	}
+}
+
+// TestAccessTokenValidate_Revoked locks in wg6: deleting the _oauth2Access
+// row (as /oauth2/revoke does) makes ValidateAccessToken return
+// ErrInactiveToken even though the underlying PB JWT is still valid.
+func TestAccessTokenValidate_Revoked(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+
+	user := seedTestUser(t, app)
+	seedTestClient(t, app)
+	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config(app))
+
+	session := &oauth2.Session{
+		DefaultSession: fositeopenid.DefaultSession{
+			Claims: &jwt.IDTokenClaims{
+				Subject:   user.Id,
+				ExpiresAt: time.Now().Add(time.Hour),
+			},
+			Headers: &jwt.Headers{},
+			Subject: user.Id,
+		},
+		CollectionId: user.Collection().Id,
+	}
+	req := &fosite.Request{Client: &fosite.DefaultClient{ID: "test"}, Session: session}
+
+	token, _, err := strategy.GenerateAccessToken(context.Background(), req)
+	if err != nil {
+		t.Fatalf("GenerateAccessToken: %v", err)
+	}
+	// Note: no _oauth2Access row → simulates a token that was revoked
+	// (row deleted) but whose PB JWT is still cryptographically valid.
+	err = strategy.ValidateAccessToken(context.Background(), req, token)
+	if err == nil {
+		t.Fatal("expected ValidateAccessToken to reject revoked token, got nil")
+	}
+	if !errors.Is(err, fosite.ErrInactiveToken) {
+		t.Errorf("expected ErrInactiveToken, got %v", err)
 	}
 }
 

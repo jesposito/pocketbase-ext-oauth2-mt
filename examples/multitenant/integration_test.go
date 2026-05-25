@@ -97,6 +97,7 @@ func newTenant(t *testing.T, name string) *tenant {
 		PathPrefix:                             "/oauth2",
 		UserCollection:                         "users",
 		EnableRFC7591DynamicClientRegistration: true,
+		AllowUnauthenticatedDynamicClientRegistration: true,
 		EnableRFC9728ProtectedResourceMetadata: true,
 	}); err != nil {
 		t.Fatalf("[%s] Register: %v", name, err)
