@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "pb_oauth2_mt",
+  "project_id": "bb5fff33-171a-4687-ac92-55fefe61a350"
+}
