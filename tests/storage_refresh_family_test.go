@@ -3,6 +3,7 @@ package oauth2
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -289,3 +290,89 @@ func TestRefreshFamily_RevokeMarksNotDeletes(t *testing.T) {
 		t.Errorf("lookup after revoke: got %v, want ErrInactiveToken", err)
 	}
 }
+
+// TestRefreshFamily_ConcurrentRotation_AtMostOneWinner verifies the race
+// fix on RotateRefreshToken. N goroutines all try to rotate the same
+// predecessor refresh signature simultaneously. Exactly ONE must succeed
+// (drives the active→rotated transition) and every other caller must
+// receive fosite.ErrSerializationFailure. Without the conditional UPDATE
+// fix, multiple callers could all observe status=active in
+// GetRefreshTokenSession, then all silently no-op in markRefreshRotated's
+// pre-fix "already rotated → return nil" branch, allowing the upstream
+// refresh-grant handler to mint sibling children from the same parent.
+func TestRefreshFamily_ConcurrentRotation_AtMostOneWinner(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+
+	seedTestClient(t, app)
+
+	store := oauth2.NewOAuth2Store(app)
+	ctx := context.Background()
+	session := makeRefreshSession("race-user")
+
+	req := &fosite.Request{
+		ID:             "race-req-root",
+		Client:         &fosite.DefaultClient{ID: testClientID},
+		RequestedScope: fosite.Arguments{"openid"},
+		GrantedScope:   fosite.Arguments{"openid"},
+		Session:        session,
+	}
+	if err := store.CreateAccessTokenSession(ctx, "race-access-0", req); err != nil {
+		t.Fatalf("create access failed: %v", err)
+	}
+	if err := store.CreateRefreshTokenSession(ctx, "race-refresh-0", "race-access-0", req); err != nil {
+		t.Fatalf("create refresh failed: %v", err)
+	}
+
+	const workers = 8
+	var (
+		wg        sync.WaitGroup
+		start     = make(chan struct{})
+		results   = make([]error, workers)
+	)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			results[idx] = store.RotateRefreshToken(ctx, "race-req-root", "race-refresh-0")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	winners := 0
+	losers := 0
+	otherErrs := []error{}
+	for _, err := range results {
+		switch {
+		case err == nil:
+			winners++
+		case errors.Is(err, fosite.ErrSerializationFailure):
+			losers++
+		default:
+			otherErrs = append(otherErrs, err)
+		}
+	}
+	if winners != 1 {
+		t.Errorf("expected exactly 1 winner, got %d (losers=%d, other=%v)",
+			winners, losers, otherErrs)
+	}
+	if losers != workers-1 {
+		t.Errorf("expected %d losers with ErrSerializationFailure, got %d (winners=%d, other=%v)",
+			workers-1, losers, winners, otherErrs)
+	}
+	if len(otherErrs) > 0 {
+		t.Errorf("unexpected error(s) from rotation: %v", otherErrs)
+	}
+
+	// Final state: row is rotated exactly once.
+	row := loadRefreshRow(t, app, "race-refresh-0")
+	if got := row.GetString("status"); got != "rotated" {
+		t.Errorf("final status = %q, want rotated", got)
+	}
+	if row.GetInt("rotated_at") == 0 {
+		t.Errorf("rotated_at must be stamped on winner")
+	}
+}
+

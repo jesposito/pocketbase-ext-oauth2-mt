@@ -406,23 +406,65 @@ func mapRFCErr(err error) error {
 // to status=rotated and stamps rotated_at. The row is intentionally kept
 // in place so a later replay of the same signature can be detected and
 // the family invalidated.
+//
+// The transition is done as a single conditional UPDATE so concurrent
+// refresh attempts on the same predecessor cannot both succeed. Two
+// callers may both pass GetRefreshTokenSession (which only reads), but
+// at most one will rotate the row from active→rotated. The loser sees
+// zero rows affected and is failed with fosite.ErrSerializationFailure
+// so the upstream refresh-grant handler aborts before
+// CreateRefreshTokenSession mints a sibling child.
 func markRefreshRotated(app core.App, signature string) error {
-	m, err := findSessionModelBySignature(app, &RefreshTokenModel{}, signature)
+	rotatedAt := time.Now().UnixMicro()
+	result, err := app.DB().NewQuery(
+		"UPDATE {{"+consts.RefreshCollectionName+"}} "+
+			"SET [[status]] = {:rotated}, [[rotated_at]] = {:at} "+
+			"WHERE [[signature]] = {:sig} AND [[status]] = {:active}").
+		Bind(dbx.Params{
+			"rotated": RefreshStatusRotated,
+			"at":      rotatedAt,
+			"sig":     signature,
+			"active":  RefreshStatusActive,
+		}).Execute()
 	if err != nil {
-		if errors.Is(err, fosite.ErrNotFound) {
-			return nil
-		}
 		return err
 	}
-	if m.GetStatus() == RefreshStatusRotated {
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
 		return nil
 	}
-	m.SetStatus(RefreshStatusRotated)
-	// Use microsecond precision so the chain order survives multiple
-	// rotations within the same wall-clock second (e.g. test loops).
-	// UnixMicro fits comfortably inside the float64 PocketBase NumberField.
-	m.SetRotatedAt(time.Now().UnixMicro())
-	return app.Save(m.ProxyRecord())
+
+	// Zero rows affected: either the row never existed, or some other
+	// caller already moved it out of "active". Disambiguate by reading
+	// the current state.
+	m, lookupErr := findSessionModelBySignature(app, &RefreshTokenModel{}, signature)
+	if lookupErr != nil {
+		if errors.Is(lookupErr, fosite.ErrNotFound) {
+			// Predecessor never existed - preserve the old idempotent
+			// behavior of this function for missing rows.
+			return nil
+		}
+		return lookupErr
+	}
+
+	switch m.GetStatus() {
+	case RefreshStatusRotated:
+		// Race lost: a concurrent worker already rotated this token.
+		// Fail so the upstream handler does NOT proceed to mint another
+		// child refresh against the same predecessor.
+		return fosite.ErrSerializationFailure.WithDebug(
+			"refresh token already rotated by a concurrent request")
+	case RefreshStatusReused, RefreshStatusRevoked:
+		// The row was invalidated out from under us (reuse detection or
+		// explicit revocation). Treat as inactive.
+		return fosite.ErrInactiveToken
+	default:
+		// Unknown state - be conservative and abort the rotation.
+		return fosite.ErrInactiveToken
+	}
 }
 
 // invalidateRefreshFamily marks every refresh row in the given family as

@@ -52,11 +52,20 @@ func RequireScope(app core.App, requiredScopes ...string) *hook.Handler[*core.Re
 
 			ctx := e.Request.Context()
 			sess := NewSession(app, "", "")
-			_, ar, ierr := inst.provider.IntrospectToken(ctx, token, fosite.AccessToken, sess)
-			if ierr != nil || ar == nil {
+			// fosite.Fosite.IntrospectToken does NOT honor the hint as a hard
+			// filter: even with hint=AccessToken it falls back to refresh-token
+			// introspection on access-token miss (see fosite v0.49
+			// handler/oauth2/introspector.go CoreValidator.IntrospectToken).
+			// So an active refresh-token would otherwise pass this middleware
+			// as long as its granted scopes match. Check the returned token
+			// use and reject anything that is not a bearer access token.
+			tu, ar, ierr := inst.provider.IntrospectToken(ctx, token, fosite.AccessToken, sess)
+			if ierr != nil || ar == nil || tu != fosite.AccessToken {
 				desc := "The access token provided is expired, revoked, malformed, or invalid for other reasons."
 				if ierr != nil {
 					desc = sanitizeHeaderValue(ierr.Error())
+				} else if ar != nil && tu != fosite.AccessToken {
+					desc = "The presented token is not an access token."
 				}
 				writeWWWAuthenticate(e, http.StatusUnauthorized,
 					fmt.Sprintf(`Bearer realm="OAuth", error="invalid_token", error_description=%q`, desc))
