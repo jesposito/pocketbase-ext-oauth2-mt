@@ -207,7 +207,7 @@ func Register(app core.App, config *Config) error {
 			compose.CommonStrategy{
 				CoreStrategy: NewPocketBaseStrategy(app, inst.cfg),
 				OpenIDConnectTokenStrategy: compose.NewOpenIDConnectStrategy(
-					func(ctx context.Context) (interface{}, error) {
+					func(ctx context.Context) (any, error) {
 						if inst.privateKey == nil {
 							panic("[Plugin/OAuth2] Private key is not initialized!! This should never happen because we load it during app bootstrap.")
 						}
@@ -279,10 +279,19 @@ func Register(app core.App, config *Config) error {
 				slog.Any("client_name", e.Record.GetString("client_name")),
 			)
 
-			h, _ := inst.cfg.GetSecretsHasher(context.Background()).Hash(
+			// Hash the plaintext client_secret on the way in. A hash
+			// failure (e.g., misconfigured bcrypt cost) MUST abort the
+			// create — silently writing the unhashed secret would leave
+			// it readable in _oauth2Clients.client_secret and break
+			// client_secret_basic / client_secret_post auth at the token
+			// endpoint.
+			h, herr := inst.cfg.GetSecretsHasher(context.Background()).Hash(
 				e.Context,
 				[]byte(e.Record.GetString("client_secret")),
 			)
+			if herr != nil {
+				return fmt.Errorf("[Plugin/OAuth2] failed to hash client_secret: %w", herr)
+			}
 			e.Record.Set("client_secret", string(h))
 			return e.Next()
 		})
@@ -486,12 +495,12 @@ func bindOAuth2WellKnownHandlers(inst *Instance, r *router.Router[*core.RequestE
 	// Authorization Server Metadata
 	// @ref https://datatracker.ietf.org/doc/html/rfc8414
 	// @ref https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata
-	handleJSON(r, "/.well-known/oauth-authorization-server", func(_ *core.RequestEvent) (interface{}, error) {
+	handleJSON(r, "/.well-known/oauth-authorization-server", func(_ *core.RequestEvent) (any, error) {
 		inst.mu.RLock()
 		defer inst.mu.RUnlock()
 		return inst.metadata.AuthorizationServerMetadata, nil
 	})
-	handleJSON(r, "/.well-known/openid-configuration", func(_ *core.RequestEvent) (interface{}, error) {
+	handleJSON(r, "/.well-known/openid-configuration", func(_ *core.RequestEvent) (any, error) {
 		inst.mu.RLock()
 		defer inst.mu.RUnlock()
 		return inst.metadata, nil
@@ -503,7 +512,7 @@ func bindOAuth2WellKnownHandlers(inst *Instance, r *router.Router[*core.RequestE
 	rfc7517KeySet := &jose.JSONWebKeySet{
 		Keys: []jose.JSONWebKey{inst.privateKey.Public()},
 	}
-	handleJSON(r, "/.well-known/jwks.json", func(_ *core.RequestEvent) (interface{}, error) {
+	handleJSON(r, "/.well-known/jwks.json", func(_ *core.RequestEvent) (any, error) {
 		return rfc7517KeySet, nil
 	})
 
@@ -511,7 +520,7 @@ func bindOAuth2WellKnownHandlers(inst *Instance, r *router.Router[*core.RequestE
 	// Protected Resource Metadata
 	// @ref https://datatracker.ietf.org/doc/html/rfc9728
 	if inst.cfg.EnableRFC9728ProtectedResourceMetadata {
-		handleJSON(r, "/.well-known/oauth-protected-resource/{resource}", func(e *core.RequestEvent) (interface{}, error) {
+		handleJSON(r, "/.well-known/oauth-protected-resource/{resource}", func(e *core.RequestEvent) (any, error) {
 			inst.mu.RLock()
 			defer inst.mu.RUnlock()
 
@@ -528,7 +537,7 @@ func bindOAuth2WellKnownHandlers(inst *Instance, r *router.Router[*core.RequestE
 	}
 }
 
-func handleJSON(r *router.Router[*core.RequestEvent], path string, getter func(e *core.RequestEvent) (interface{}, error)) {
+func handleJSON(r *router.Router[*core.RequestEvent], path string, getter func(e *core.RequestEvent) (any, error)) {
 	h := func(e *core.RequestEvent) error {
 		req := e.Request
 		w := e.Response

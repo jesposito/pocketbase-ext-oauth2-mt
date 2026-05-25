@@ -106,6 +106,7 @@ func TestLooksLikeEnvelope_RejectsPlaintext(t *testing.T) {
 func TestDecodeMasterKey_AcceptsFormats(t *testing.T) {
 	want := bytes.Repeat([]byte{0x11}, 32)
 	cases := map[string]string{
+		"raw-32":      string(want),
 		"hex":         hex.EncodeToString(want),
 		"std-base64":  base64.StdEncoding.EncodeToString(want),
 		"raw-base64":  base64.RawStdEncoding.EncodeToString(want),
@@ -129,7 +130,11 @@ func TestDecodeMasterKey_RejectsBadInput(t *testing.T) {
 	cases := []string{
 		"",
 		"not-a-key",
-		hex.EncodeToString(bytes.Repeat([]byte{0x11}, 16)), // 16 bytes
+		// Wrong-length hex: 31 bytes -> 62 chars, neither raw-32 nor hex-32.
+		hex.EncodeToString(bytes.Repeat([]byte{0x11}, 31)),
+		// Wrong-length base64: 16 bytes -> 24 chars, neither raw-32 nor any
+		// recognized 32-byte encoding.
+		base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 16)),
 	}
 	for _, raw := range cases {
 		if _, err := decodeMasterKey(raw); err == nil {
@@ -189,7 +194,7 @@ func TestEnvelope_JSONShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var raw map[string]interface{}
+	var raw map[string]any
 	if err := json.Unmarshal(sealed, &raw); err != nil {
 		t.Fatal(err)
 	}

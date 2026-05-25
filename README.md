@@ -178,6 +178,30 @@ The metadata will be available at `/.well-known/oauth-protected-resource/data`.
 
 ---
 
+## Scope & Roadmap
+
+### What is in scope
+
+- **OAuth 2.1** authorization code flow with PKCE (PKCE required by default)
+- **OpenID Connect** Core 1.0 (authorization code flow + ID tokens, RS256)
+- **Discovery** via RFC 8414 (OAuth Authorization Server Metadata) and OpenID Connect Discovery 1.0
+- **Dynamic Client Registration** (RFC 7591, optional)
+- **Protected Resource Metadata** (RFC 9728, optional)
+- **Token revocation** (RFC 7009) and **introspection** (RFC 7662)
+- **RFC 9207** Authorization Response Issuer Identification (`iss` on success and error redirects)
+- **Refresh-token rotation with reuse detection** (refresh-token family tracking)
+- **Envelope encryption at rest** (AES-256-GCM) for OAuth signing key material in `_params`, keyed off `OAUTH2_MASTER_KEY`
+
+### What is deliberately out of scope (v1)
+
+- **Pushed Authorization Requests (PAR, RFC 9126)** — not required by OAuth 2.1 baseline. PAR is a FAPI / high-assurance profile feature. Adding PAR would require a fosite PAR factory, a `/oauth2/par` endpoint, PARStorage, and `pushed_authorization_request_endpoint` discovery metadata. Revisit if FAPI conformance becomes a goal.
+- **DPoP sender-constrained tokens (RFC 9449)** — out of scope for the same reason. DPoP is a FAPI / mobile-app-protected-resource feature. Revisit if FAPI conformance becomes a goal.
+- **mTLS-bound tokens (RFC 8705)** — same reasoning.
+
+These decisions are recorded here so reviewers don't re-raise them. The plugin tracks OAuth 2.1 baseline + commonly-deployed extensions; FAPI work is a separate epic.
+
+---
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

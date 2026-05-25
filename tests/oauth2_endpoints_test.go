@@ -279,6 +279,83 @@ func TestAuthEndpoint_UnauthenticatedRedirects(t *testing.T) {
 	scenario.Test(t)
 }
 
+// TestAuthEndpoint_AccessDeniedRedirect verifies that when the consent UI
+// posts ?error=access_denied (user clicked "Decline"), the OP redirects to
+// the client with error=access_denied (not server_error) AND includes the
+// RFC 9207 iss parameter. Covers beads pb-oauth2-mt-5sf and pb-oauth2-mt-iad.
+func TestAuthEndpoint_AccessDeniedRedirect(t *testing.T) {
+	scenario := tests.ApiScenario{
+		Name:   "auth - access_denied carries error+iss back to client",
+		Method: http.MethodGet,
+		URL: "/oauth2/auth?response_type=code&client_id=" + testClientID +
+			"&redirect_uri=" + testRedirectURI +
+			"&scope=openid&state=teststate&code_challenge=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG" +
+			"&code_challenge_method=S256&error=access_denied",
+		ExpectedStatus: http.StatusSeeOther,
+		TestAppFactory: func(t testing.TB) *tests.TestApp {
+			return setupTestAppForScenario(t)
+		},
+		BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+			seedUsersCollection(t, app)
+			seedTestClient(t, app)
+		},
+		AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
+			loc := res.Header.Get("Location")
+			if loc == "" {
+				t.Fatal("expected Location header for error redirect")
+			}
+			if !strings.HasPrefix(loc, testRedirectURI) {
+				t.Errorf("redirect not back to client redirect_uri: %s", loc)
+			}
+			if !strings.Contains(loc, "error=access_denied") {
+				t.Errorf("expected error=access_denied in redirect, got %s", loc)
+			}
+			if strings.Contains(loc, "error=server_error") {
+				t.Errorf("expected access_denied, got server_error in %s", loc)
+			}
+			if !strings.Contains(loc, "iss=") {
+				t.Errorf("expected RFC 9207 iss= in error redirect, got %s", loc)
+			}
+			if !strings.Contains(loc, "state=teststate") {
+				t.Errorf("expected state echo in redirect, got %s", loc)
+			}
+		},
+	}
+	scenario.Test(t)
+}
+
+// TestAuthEndpoint_LoginRequiredHasIss verifies that login_required (a
+// non-access_denied error already in the switch) also carries iss in its
+// error redirect. Companion to TestAuthEndpoint_AccessDeniedRedirect for iad.
+func TestAuthEndpoint_LoginRequiredHasIss(t *testing.T) {
+	scenario := tests.ApiScenario{
+		Name:   "auth - login_required error includes iss",
+		Method: http.MethodGet,
+		URL: "/oauth2/auth?response_type=code&client_id=" + testClientID +
+			"&redirect_uri=" + testRedirectURI +
+			"&scope=openid&state=teststate&code_challenge=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG" +
+			"&code_challenge_method=S256&error=login_required",
+		ExpectedStatus: http.StatusSeeOther,
+		TestAppFactory: func(t testing.TB) *tests.TestApp {
+			return setupTestAppForScenario(t)
+		},
+		BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
+			seedUsersCollection(t, app)
+			seedTestClient(t, app)
+		},
+		AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
+			loc := res.Header.Get("Location")
+			if !strings.Contains(loc, "error=login_required") {
+				t.Errorf("expected error=login_required in %s", loc)
+			}
+			if !strings.Contains(loc, "iss=") {
+				t.Errorf("expected iss= in %s", loc)
+			}
+		},
+	}
+	scenario.Test(t)
+}
+
 func TestAuthEndpoint_MissingClientID(t *testing.T) {
 	scenario := tests.ApiScenario{
 		Name:            "auth - missing client_id",

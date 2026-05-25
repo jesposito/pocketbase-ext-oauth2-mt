@@ -19,9 +19,10 @@ import (
 )
 
 // envEnvelopeMasterKey is the environment variable that, when set, enables
-// envelope encryption of OAuth2 key material at rest. Accepts either a
-// base64-encoded 32-byte value, a hex-encoded 32-byte value, or a
-// "kms://..." URL (reserved for future KMS providers, not implemented yet).
+// envelope encryption of OAuth2 key material at rest. Accepts a raw 32-byte
+// value, a base64-encoded 32-byte value (std or url, padded or unpadded), a
+// hex-encoded 32-byte value, or a "kms://..." URL (reserved for future KMS
+// providers, not implemented yet).
 const envEnvelopeMasterKey = "OAUTH2_MASTER_KEY"
 
 // envelopeVersion is the only currently understood envelope version. Old
@@ -91,10 +92,17 @@ func (p envMasterKeyProvider) Fingerprint(ctx context.Context) (string, error) {
 	return fingerprintOf(master), nil
 }
 
-// decodeMasterKey accepts the master key as base64 (std or url, padded or
-// not) or hex, and returns exactly 32 bytes.
+// decodeMasterKey accepts the master key as a raw 32-byte string, base64 (std
+// or url, padded or not), or hex, and returns exactly 32 bytes. The
+// detection order is unambiguous: raw 32 bytes is len==32, hex-encoded 32
+// bytes is len==64, base64-encoded 32 bytes is len==43 (raw) or 44 (padded).
 func decodeMasterKey(raw string) ([]byte, error) {
-	// Try hex first when it looks hex-shaped (64 chars, all hex).
+	// Raw 32-byte short-circuit. A literal 32-byte secret is len==32,
+	// which cannot collide with the encoded forms (hex=64, base64>=43).
+	if len(raw) == 32 {
+		return []byte(raw), nil
+	}
+	// Try hex when it looks hex-shaped (64 chars, all hex).
 	if len(raw) == 64 {
 		if b, err := hex.DecodeString(raw); err == nil {
 			if len(b) != 32 {
@@ -116,7 +124,7 @@ func decodeMasterKey(raw string) ([]byte, error) {
 			}
 		}
 	}
-	return nil, errors.New("master key must be 32 bytes encoded as base64 or hex")
+	return nil, errors.New("master key must be 32 bytes as raw string, base64, or hex")
 }
 
 // fingerprintOf returns the short fingerprint used for the mismatch guard.
