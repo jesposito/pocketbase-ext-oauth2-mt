@@ -1,6 +1,6 @@
 package openid
 
-import "github.com/benjamesfleming/pocketbase-ext-oauth2/rfc8414"
+import "github.com/jesposito/pocketbase-ext-oauth2-mt/rfc8414"
 
 // @ref https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata
 

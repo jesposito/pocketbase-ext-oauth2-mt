@@ -3,8 +3,8 @@ package oauth2
 import (
 	"strings"
 
-	"github.com/benjamesfleming/pocketbase-ext-oauth2/client"
-	"github.com/benjamesfleming/pocketbase-ext-oauth2/consts"
+	"github.com/jesposito/pocketbase-ext-oauth2-mt/client"
+	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"github.com/pocketbase/pocketbase/core"
@@ -44,9 +44,10 @@ func NewClientFromRFC7591Metadata(app core.App, md *RFC7591ClientMetadataRequest
 		// this list are service specific.  If omitted, an authorization
 		// server MAY register a client with a default set of scopes.
 		// @ref https://datatracker.ietf.org/doc/html/rfc7591#section-2
-		oauth2ProviderMetadataMu.RLock()
-		md.Scope = strings.Join(oauth2ProviderMetadata.ScopesSupported, " ")
-		oauth2ProviderMetadataMu.RUnlock()
+		inst := mustGetInstance(app)
+		inst.mu.RLock()
+		md.Scope = strings.Join(inst.metadata.ScopesSupported, " ")
+		inst.mu.RUnlock()
 	}
 
 	if md.Contacts == nil {

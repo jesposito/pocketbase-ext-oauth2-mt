@@ -46,7 +46,7 @@ type RFC7591ClientMetadata struct {
 }
 
 // @ref https://datatracker.ietf.org/doc/html/rfc7591#section-3
-func api_OAuth2Register(e *core.RequestEvent) error {
+func api_OAuth2Register(e *core.RequestEvent, inst *Instance) error {
 	r := e.Request
 	w := e.Response
 
@@ -64,14 +64,10 @@ func api_OAuth2Register(e *core.RequestEvent) error {
 		return e.BadRequestError("redirect_uris is required", nil)
 	}
 
-	//
-
-	c, clientSecret, err := GetOAuth2Store().RegisterClient(r.Context(), &md)
+	c, clientSecret, err := inst.store.RegisterClient(r.Context(), &md)
 	if err != nil {
 		return e.InternalServerError("", err)
 	}
-
-	//
 
 	resp := &RFC7591ClientMetadata{
 		RFC7591ClientMetadataRequest: md,
@@ -79,8 +75,6 @@ func api_OAuth2Register(e *core.RequestEvent) error {
 		ClientSecret:                 clientSecret,
 		ClientSecretExpiresAt:        0,
 	}
-
-	//
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)

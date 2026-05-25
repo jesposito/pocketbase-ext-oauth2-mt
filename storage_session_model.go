@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/benjamesfleming/pocketbase-ext-oauth2/consts"
+	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
 	"github.com/ory/fosite"
 	"github.com/pocketbase/pocketbase/core"
 )

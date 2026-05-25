@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	oauth2 "github.com/benjamesfleming/pocketbase-ext-oauth2"
-	"github.com/benjamesfleming/pocketbase-ext-oauth2/consts"
+	oauth2 "github.com/jesposito/pocketbase-ext-oauth2-mt"
+	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 )
@@ -40,7 +40,7 @@ func TestRegister_SetsDefaults(t *testing.T) {
 	app := setupTestApp(t)
 	defer app.Cleanup()
 
-	cfg := oauth2.GetOAuth2Config()
+	cfg := oauth2.GetOAuth2Config(app)
 	if cfg.PathPrefix != "/oauth2" {
 		t.Errorf("PathPrefix = %q, want %q", cfg.PathPrefix, "/oauth2")
 	}
@@ -53,15 +53,10 @@ func TestRegister_SetsDefaults(t *testing.T) {
 }
 
 func TestIsRegistered(t *testing.T) {
-	oauth2.ResetGlobalStateForTests()
-	if oauth2.IsRegistered() {
-		t.Error("expected IsRegistered=false before Register")
-	}
-
 	app := setupTestApp(t)
 	defer app.Cleanup()
 
-	if !oauth2.IsRegistered() {
+	if !oauth2.IsRegistered(app) {
 		t.Error("expected IsRegistered=true after Register")
 	}
 }

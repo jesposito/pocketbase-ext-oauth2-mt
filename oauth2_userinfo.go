@@ -324,7 +324,7 @@ var _ UserInfoClaimStrategy = (*DefaultUserInfoClaimStrategy)(nil)
 
 //
 
-func api_OAuth2UserInfo(e *core.RequestEvent) error {
+func api_OAuth2UserInfo(e *core.RequestEvent, inst *Instance) error {
 
 	// TODO: Support provided scopes to determine which claims to return.
 	//       For now we will just return all claims that we can populate
@@ -335,10 +335,9 @@ func api_OAuth2UserInfo(e *core.RequestEvent) error {
 	//                   name in userinfo response."
 	scopes := []string{"openid", "profile", "address", "email"}
 
-	info, err := GetOAuth2Config().UserInfoClaimStrategy.GetUserInfoClaims(e, scopes)
+	info, err := inst.cfg.UserInfoClaimStrategy.GetUserInfoClaims(e, scopes)
 	if err != nil {
 		return e.InternalServerError("", errors.Wrap(err, "GetUserInfoClaims"))
-	} else {
-		return e.JSON(http.StatusOK, info)
 	}
+	return e.JSON(http.StatusOK, info)
 }

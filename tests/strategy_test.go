@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	oauth2 "github.com/benjamesfleming/pocketbase-ext-oauth2"
+	oauth2 "github.com/jesposito/pocketbase-ext-oauth2-mt"
 	"github.com/ory/fosite"
 	fositeoauth2 "github.com/ory/fosite/handler/oauth2"
 	fositeopenid "github.com/ory/fosite/handler/openid"
@@ -16,7 +16,7 @@ func TestPocketBaseStrategyImplementsInterface(t *testing.T) {
 	app := setupTestApp(t)
 	defer app.Cleanup()
 
-	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config())
+	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config(app))
 	if strategy == nil {
 		t.Fatal("expected non-nil strategy")
 	}
@@ -48,7 +48,7 @@ func TestAccessTokenGenerate(t *testing.T) {
 	defer app.Cleanup()
 
 	user := seedTestUser(t, app)
-	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config())
+	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config(app))
 
 	session := &oauth2.Session{
 		DefaultSession: fositeopenid.DefaultSession{
@@ -84,7 +84,7 @@ func TestAccessTokenValidate(t *testing.T) {
 	defer app.Cleanup()
 
 	user := seedTestUser(t, app)
-	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config())
+	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config(app))
 
 	session := &oauth2.Session{
 		DefaultSession: fositeopenid.DefaultSession{
@@ -119,7 +119,7 @@ func TestAccessTokenValidate_Malformed(t *testing.T) {
 	app := setupTestApp(t)
 	defer app.Cleanup()
 
-	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config())
+	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config(app))
 	req := &fosite.Request{
 		Client:      &fosite.DefaultClient{ID: "test"},
 		Session:     &oauth2.Session{},
@@ -155,7 +155,7 @@ func TestRefreshTokenGenerate(t *testing.T) {
 	app := setupTestApp(t)
 	defer app.Cleanup()
 
-	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config())
+	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config(app))
 	session := makeStrategySession()
 
 	req := &fosite.Request{
@@ -180,7 +180,7 @@ func TestRefreshTokenSignature(t *testing.T) {
 	app := setupTestApp(t)
 	defer app.Cleanup()
 
-	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config())
+	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config(app))
 	session := makeStrategySession()
 
 	req := &fosite.Request{
@@ -204,7 +204,7 @@ func TestAuthorizeCodeGenerate(t *testing.T) {
 	app := setupTestApp(t)
 	defer app.Cleanup()
 
-	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config())
+	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config(app))
 	session := makeStrategySession()
 
 	req := &fosite.Request{
@@ -229,7 +229,7 @@ func TestAuthorizeCodeValidate(t *testing.T) {
 	app := setupTestApp(t)
 	defer app.Cleanup()
 
-	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config())
+	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config(app))
 	session := makeStrategySession()
 
 	req := &fosite.Request{

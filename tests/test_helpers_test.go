@@ -5,8 +5,8 @@ import (
 	"os"
 	"testing"
 
-	oauth2 "github.com/benjamesfleming/pocketbase-ext-oauth2"
-	"github.com/benjamesfleming/pocketbase-ext-oauth2/consts"
+	oauth2 "github.com/jesposito/pocketbase-ext-oauth2-mt"
+	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
 	"github.com/ory/fosite"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tests"
@@ -28,7 +28,7 @@ const (
 // The caller should defer testApp.Cleanup().
 func setupTestApp(t testing.TB) *tests.TestApp {
 	t.Helper()
-	oauth2.ResetGlobalStateForTests()
+	// State is per-app; no global reset needed.
 	tempDir, err := os.MkdirTemp("", "pb_oauth2_test_*")
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +100,7 @@ func seedTestClient(t testing.TB, app core.App) *core.Record {
 	if err != nil {
 		t.Fatalf("failed to find clients collection: %v", err)
 	}
-	h, _ := oauth2.GetOAuth2Config().GetSecretsHasher(context.Background()).Hash(
+	h, _ := oauth2.GetOAuth2Config(app).GetSecretsHasher(context.Background()).Hash(
 		context.Background(),
 		[]byte(testClientSecret),
 	)

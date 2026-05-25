@@ -9,14 +9,14 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 )
 
-func api_OAuth2Revoke(e *core.RequestEvent) error {
+func api_OAuth2Revoke(e *core.RequestEvent, inst *Instance) error {
 	r := e.Request
 	w := e.Response
 	// This context will be passed to all methods.
 	ctx := r.Context()
 	// This will accept the token revocation request and validate various parameters.
 	// All done, send the response.
-	err := oauth2.NewRevocationRequest(ctx, r)
+	err := inst.provider.NewRevocationRequest(ctx, r)
 	if err != nil {
 		e.App.Logger().Info("[Plugin/OAuth2] Error occurred in NewRevocationRequest", slog.Any("error", err))
 		var rfc6749err *fosite.RFC6749Error
@@ -25,6 +25,6 @@ func api_OAuth2Revoke(e *core.RequestEvent) error {
 			e.App.Logger().Debug(fmt.Sprintf("[Plugin/OAuth2] %+v", rfc6749err.StackTrace()))
 		}
 	}
-	oauth2.WriteRevocationResponse(ctx, w, err)
+	inst.provider.WriteRevocationResponse(ctx, w, err)
 	return nil
 }

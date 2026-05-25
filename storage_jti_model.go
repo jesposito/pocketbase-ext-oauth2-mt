@@ -1,7 +1,7 @@
 package oauth2
 
 import (
-	"github.com/benjamesfleming/pocketbase-ext-oauth2/consts"
+	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
 	"github.com/pocketbase/pocketbase/core"
 )
 

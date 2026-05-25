@@ -3,8 +3,8 @@ package oauth2
 import (
 	"testing"
 
-	oauth2 "github.com/benjamesfleming/pocketbase-ext-oauth2"
-	"github.com/benjamesfleming/pocketbase-ext-oauth2/consts"
+	oauth2 "github.com/jesposito/pocketbase-ext-oauth2-mt"
+	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
 	"github.com/pocketbase/pocketbase/core"
 )
 
