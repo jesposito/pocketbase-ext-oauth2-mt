@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/ory/fosite"
 	fositeoauth2 "github.com/ory/fosite/handler/oauth2"
 	fositeopenid "github.com/ory/fosite/handler/openid"
@@ -118,12 +119,58 @@ func (s *OAuth2Store) CreateAccessTokenSession(ctx context.Context, signature st
 }
 
 // CreateRefreshTokenSession implements [oauth2.RefreshTokenStorage].
+//
+// Family-tracking behavior:
+//   - On an authorization_code-grant issuance (chain root), a fresh
+//     family_id is generated and parent_refresh_id is left empty.
+//   - On a refresh_token-grant rotation, the predecessor row (already
+//     marked status=rotated by RotateRefreshToken) is located by request_id
+//     and the new row inherits its family_id with parent_refresh_id set to
+//     the predecessor's record id.
+//   - status defaults to active.
 func (s *OAuth2Store) CreateRefreshTokenSession(ctx context.Context, signature string, accessSignature string, request fosite.Requester) (err error) {
 	m := newSessionModel(s.app, &RefreshTokenModel{})
 	m.SetSignature(signature)
-	m.SetRequester(request, fosite.RefreshToken)
+	if err := m.SetRequester(request, fosite.RefreshToken); err != nil {
+		return err
+	}
+
+	familyID, parentID := s.resolveRefreshLineage(request)
+	m.SetFamilyID(familyID)
+	m.SetParentRefreshID(parentID)
+	m.SetStatus(RefreshStatusActive)
+	m.SetRotatedAt(0)
+	m.SetReusedAt(0)
 
 	return s.app.Save(m)
+}
+
+// resolveRefreshLineage decides the family_id and parent_refresh_id for a
+// newly created refresh row. The fosite refresh-grant handler calls
+// RotateRefreshToken before CreateRefreshTokenSession and propagates the
+// original request id (see fosite/handler/oauth2/flow_refresh.go), so the
+// predecessor row is the one with the same request_id that we just marked
+// rotated. If no such predecessor exists, this is a new chain root.
+func (s *OAuth2Store) resolveRefreshLineage(request fosite.Requester) (familyID string, parentRefreshID string) {
+	requestID := request.GetID()
+	if requestID != "" {
+		c, err := s.app.FindCachedCollectionByNameOrId(consts.RefreshCollectionName)
+		if err == nil {
+			parent := &RefreshTokenModel{}
+			err = s.app.RecordQuery(c).
+				AndWhere(dbx.HashExp{
+					"request_id": requestID,
+					"status":     RefreshStatusRotated,
+				}).
+				OrderBy("rotated_at DESC").
+				Limit(1).
+				One(parent)
+			if err == nil && parent.GetFamilyID() != "" {
+				return parent.GetFamilyID(), parent.GetID()
+			}
+		}
+	}
+	return uuid.NewString(), ""
 }
 
 // DeleteAccessTokenSession implements [oauth2.AccessTokenStorage].
@@ -147,10 +194,28 @@ func (s *OAuth2Store) GetAccessTokenSession(ctx context.Context, signature strin
 }
 
 // GetRefreshTokenSession implements [oauth2.RefreshTokenStorage].
+//
+// Reuse detection: if the row exists but its status is not "active" the
+// token is being replayed. We invalidate every row in the same family
+// (status=reused, reused_at=now) and delete every access token issued
+// against any row in the family, then return fosite.ErrInactiveToken so
+// the upstream refresh-grant handler treats it as reuse per RFC 6819
+// section 5.2.2.3.
 func (s *OAuth2Store) GetRefreshTokenSession(ctx context.Context, signature string, session fosite.Session) (request fosite.Requester, err error) {
 	m, err := findSessionModelBySignature(s.app, &RefreshTokenModel{}, signature)
 	if err != nil {
 		return nil, err
+	}
+
+	if m.GetStatus() != RefreshStatusActive {
+		req, _ := m.ToRequest(ctx, s, session)
+		// Best-effort family invalidation. Even if invalidation hits a
+		// transient error we still surface ErrInactiveToken so the
+		// upstream handler aborts the refresh attempt.
+		if familyID := m.GetFamilyID(); familyID != "" {
+			_ = invalidateRefreshFamily(s.app, familyID)
+		}
+		return req, fosite.ErrInactiveToken
 	}
 
 	return m.ToRequest(ctx, s, session)
@@ -161,17 +226,35 @@ func (s *OAuth2Store) RevokeAccessToken(ctx context.Context, requestID string) e
 	return deleteSessionModelByRequestID(s.app, &AccessTokenModel{}, requestID)
 }
 
-// RevokeRefreshToken implements [oauth2.RefreshTokenStorage].
+// RevokeRefreshToken implements [oauth2.TokenRevocationStorage].
+//
+// The row is marked status=revoked instead of being deleted so a later
+// replay of the same signature is still caught as reuse against the
+// family breadcrumb. The cleanup cron deletes the row eventually via
+// expires_at.
 func (s *OAuth2Store) RevokeRefreshToken(ctx context.Context, requestID string) error {
-	return deleteSessionModelByRequestID(s.app, &RefreshTokenModel{}, requestID)
+	m, err := findSessionModelByRequestID(s.app, &RefreshTokenModel{}, requestID)
+	if err != nil {
+		if errors.Is(err, fosite.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	m.SetStatus(RefreshStatusRevoked)
+	return s.app.Save(m.ProxyRecord())
 }
 
 // RotateRefreshToken implements [oauth2.RefreshTokenStorage].
+//
+// Marks the predecessor refresh row as rotated (keeping the family
+// breadcrumb for reuse detection) and deletes the predecessor access
+// token by request_id. The replacement refresh row is created by the
+// upstream handler in a follow-up CreateRefreshTokenSession call.
 func (s *OAuth2Store) RotateRefreshToken(ctx context.Context, requestID string, refreshTokenSignature string) (err error) {
-	// TODO: Is this a 1-1? If not we might need to delete some more sessions here.
-	deleteSessionModelBySignature(s.app, &RefreshTokenModel{}, refreshTokenSignature)
-	deleteSessionModelByRequestID(s.app, &AccessTokenModel{}, requestID)
-	return nil
+	if err := markRefreshRotated(s.app, refreshTokenSignature); err != nil {
+		return err
+	}
+	return deleteSessionModelByRequestID(s.app, &AccessTokenModel{}, requestID)
 }
 
 // CreatePKCERequestSession implements [pkce.PKCERequestStorage].
@@ -317,4 +400,70 @@ func mapRFCErr(err error) error {
 		return fosite.ErrNotFound
 	}
 	return err
+}
+
+// markRefreshRotated transitions the refresh row identified by signature
+// to status=rotated and stamps rotated_at. The row is intentionally kept
+// in place so a later replay of the same signature can be detected and
+// the family invalidated.
+func markRefreshRotated(app core.App, signature string) error {
+	m, err := findSessionModelBySignature(app, &RefreshTokenModel{}, signature)
+	if err != nil {
+		if errors.Is(err, fosite.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	if m.GetStatus() == RefreshStatusRotated {
+		return nil
+	}
+	m.SetStatus(RefreshStatusRotated)
+	// Use microsecond precision so the chain order survives multiple
+	// rotations within the same wall-clock second (e.g. test loops).
+	// UnixMicro fits comfortably inside the float64 PocketBase NumberField.
+	m.SetRotatedAt(time.Now().UnixMicro())
+	return app.Save(m.ProxyRecord())
+}
+
+// invalidateRefreshFamily marks every refresh row in the given family as
+// reused (status=reused, reused_at=now) and deletes every access token
+// whose request_id matches any row in the family. Best-effort: per-row
+// failures are not propagated so a single bad record cannot mask a
+// reuse signal for the rest of the chain.
+func invalidateRefreshFamily(app core.App, familyID string) error {
+	if familyID == "" {
+		return nil
+	}
+	c, err := app.FindCachedCollectionByNameOrId(consts.RefreshCollectionName)
+	if err != nil {
+		return err
+	}
+	var rows []*RefreshTokenModel
+	if err := app.RecordQuery(c).
+		AndWhere(dbx.HashExp{"family_id": familyID}).
+		All(&rows); err != nil {
+		return err
+	}
+
+	now := time.Now().UnixMicro()
+	seenRequestIDs := map[string]struct{}{}
+	for _, row := range rows {
+		if reqID := row.GetRequestID(); reqID != "" {
+			seenRequestIDs[reqID] = struct{}{}
+		}
+		if row.GetStatus() == RefreshStatusReused {
+			continue
+		}
+		row.SetStatus(RefreshStatusReused)
+		if row.GetReusedAt() == 0 {
+			row.SetReusedAt(now)
+		}
+		_ = app.Save(row.ProxyRecord())
+	}
+
+	for reqID := range seenRequestIDs {
+		_ = deleteSessionModelByRequestID(app, &AccessTokenModel{}, reqID)
+	}
+
+	return nil
 }
