@@ -34,9 +34,18 @@ type Interaction struct {
 	RedirectURI     string
 	RequestForm     url.Values
 	RequestedScopes []string
-	Prompt          string
-	RequestedAt     time.Time
-	ExpiresAt       time.Time
+	// RequestedAcrValues — space-separated acr_values from the original
+	// authorize request, parsed into the standard list shape. The
+	// consumer (login UI) MUST inspect this and either satisfy the
+	// requested authentication context (e.g. force a passkey assertion
+	// when "loa3" is requested) or surface the
+	// insufficient_user_authentication error via /login/complete with
+	// decision="acr_unsatisfiable". Empty = no requested values, any
+	// auth method is acceptable.
+	RequestedAcrValues []string
+	Prompt             string
+	RequestedAt        time.Time
+	ExpiresAt          time.Time
 }
 
 // CreateInteraction persists a new pending authorization for later
@@ -63,6 +72,10 @@ func CreateInteraction(app core.App, in *Interaction) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal requested_scopes: %w", err)
 	}
+	acrJSON, err := json.Marshal(in.RequestedAcrValues)
+	if err != nil {
+		return "", fmt.Errorf("marshal requested_acr_values: %w", err)
+	}
 	rec := core.NewRecord(c)
 	rec.Id = in.ID
 	rec.Set("client_id", in.ClientID)
@@ -71,6 +84,7 @@ func CreateInteraction(app core.App, in *Interaction) (string, error) {
 	rec.Set("redirect_uri", in.RedirectURI)
 	rec.Set("request_form", string(formJSON))
 	rec.Set("requested_scopes", string(scopesJSON))
+	rec.Set("requested_acr_values", string(acrJSON))
 	rec.Set("requested_at", in.RequestedAt.Unix())
 	rec.Set("expires_at", in.ExpiresAt.Unix())
 	rec.Set("prompt", in.Prompt)
@@ -101,17 +115,20 @@ func FindInteraction(app core.App, id string) (*Interaction, error) {
 	}
 	var scopes []string
 	_ = json.Unmarshal([]byte(rec.GetString("requested_scopes")), &scopes)
+	var acrValues []string
+	_ = json.Unmarshal([]byte(rec.GetString("requested_acr_values")), &acrValues)
 	return &Interaction{
-		ID:              rec.Id,
-		ClientID:        rec.GetString("client_id"),
-		ClientName:      rec.GetString("client_name"),
-		UserCollection:  rec.GetString("user_collection"),
-		RedirectURI:     rec.GetString("redirect_uri"),
-		RequestForm:     form,
-		RequestedScopes: scopes,
-		Prompt:          rec.GetString("prompt"),
-		RequestedAt:     time.Unix(int64(rec.GetInt("requested_at")), 0).UTC(),
-		ExpiresAt:       time.Unix(int64(exp), 0).UTC(),
+		ID:                 rec.Id,
+		ClientID:           rec.GetString("client_id"),
+		ClientName:         rec.GetString("client_name"),
+		UserCollection:     rec.GetString("user_collection"),
+		RedirectURI:        rec.GetString("redirect_uri"),
+		RequestForm:        form,
+		RequestedScopes:    scopes,
+		RequestedAcrValues: acrValues,
+		Prompt:             rec.GetString("prompt"),
+		RequestedAt:        time.Unix(int64(rec.GetInt("requested_at")), 0).UTC(),
+		ExpiresAt:          time.Unix(int64(exp), 0).UTC(),
 	}, nil
 }
 
