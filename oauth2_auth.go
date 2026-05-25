@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jesposito/pocketbase-ext-oauth2-mt/client"
@@ -96,20 +97,42 @@ func api_OAuth2Authorize(e *core.RequestEvent, inst *Instance) error {
 	formCopy.Del("pb_token")
 	formCopy.Del("pb_token_iat")
 	interactionID, ierr := CreateInteraction(e.App, &Interaction{
-		ClientID:        c.ID,
-		ClientName:      c.Name,
-		UserCollection:  inst.cfg.UserCollection,
-		RedirectURI:     c.GetRedirectURIs()[0],
-		RequestForm:     formCopy,
-		RequestedScopes: ar.GetRequestedScopes(),
-		Prompt:          ar.GetRequestForm().Get("prompt"),
-		RequestedAt:     requestedAt,
+		ClientID:           c.ID,
+		ClientName:         c.Name,
+		UserCollection:     inst.cfg.UserCollection,
+		RedirectURI:        c.GetRedirectURIs()[0],
+		RequestForm:        formCopy,
+		RequestedScopes:    ar.GetRequestedScopes(),
+		RequestedAcrValues: parseAcrValues(ar.GetRequestForm().Get("acr_values")),
+		Prompt:             ar.GetRequestForm().Get("prompt"),
+		RequestedAt:        requestedAt,
 	})
 	if ierr != nil {
 		return e.InternalServerError("failed to create interaction", ierr)
 	}
 	return e.Redirect(http.StatusTemporaryRedirect,
 		e.App.Settings().Meta.AppURL+inst.cfg.PathPrefix+"/login?interaction_id="+interactionID)
+}
+
+// parseAcrValues splits the space-separated acr_values parameter from
+// the authorize request into a slice. Empty / blank input → nil. Per
+// OIDC Core §3.1.2.1 the value is a space-separated list of voluntary
+// requested Authentication Context Class References, ordered by
+// preference (first = highest priority). We preserve the order so the
+// consumer can apply that preference verbatim.
+func parseAcrValues(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Fields(raw)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // writeAuthorizeErrorWithIss writes a fosite authorize error response with

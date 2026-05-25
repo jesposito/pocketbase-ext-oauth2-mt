@@ -24,13 +24,21 @@ var urlParse = url.Parse
 // learn what consent screen to render — without ever decoding a
 // browser-controlled state blob (lr7).
 type loginStateResponse struct {
-	ClientID        string   `json:"client_id"`
-	ClientName      string   `json:"client_name"`
-	UserCollection  string   `json:"user_collection"`
-	RequestedScopes []string `json:"requested_scopes"`
-	GrantedScopes   []string `json:"granted_scopes"` // previously consented scopes for this (user not known yet here, so empty) → kept for future
-	Prompt          string   `json:"prompt"`
-	ExpiresAt       int64    `json:"expires_at"`
+	ClientID           string   `json:"client_id"`
+	ClientName         string   `json:"client_name"`
+	UserCollection     string   `json:"user_collection"`
+	RequestedScopes    []string `json:"requested_scopes"`
+	GrantedScopes      []string `json:"granted_scopes"` // previously consented scopes for this (user not known yet here, so empty) → kept for future
+	// RequestedAcrValues — passed through verbatim from the original
+	// authorize request's acr_values parameter. Consumer's login UI MUST
+	// inspect this list and either satisfy the highest-priority value it
+	// recognises before completing the ceremony, or POST decision=
+	// "acr_unsatisfiable" to surface the standard OIDC
+	// insufficient_user_authentication error to the client. Empty list
+	// means no specific context requested — any auth method is fine.
+	RequestedAcrValues []string `json:"requested_acr_values,omitempty"`
+	Prompt             string   `json:"prompt"`
+	ExpiresAt          int64    `json:"expires_at"`
 }
 
 // loginCompleteRequest is the JSON body the UI POSTs to /oauth2/login/complete.
@@ -82,12 +90,13 @@ func api_OAuth2LoginState(e *core.RequestEvent, inst *Instance) error {
 	}
 
 	resp := loginStateResponse{
-		ClientID:        in.ClientID,
-		ClientName:      in.ClientName,
-		UserCollection:  in.UserCollection,
-		RequestedScopes: in.RequestedScopes,
-		Prompt:          in.Prompt,
-		ExpiresAt:       in.ExpiresAt.Unix(),
+		ClientID:           in.ClientID,
+		ClientName:         in.ClientName,
+		UserCollection:     in.UserCollection,
+		RequestedScopes:    in.RequestedScopes,
+		RequestedAcrValues: in.RequestedAcrValues,
+		Prompt:             in.Prompt,
+		ExpiresAt:          in.ExpiresAt.Unix(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
