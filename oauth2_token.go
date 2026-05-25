@@ -34,14 +34,10 @@ func api_OAuth2Token(e *core.RequestEvent, inst *Instance) error {
 		return nil
 	}
 
-	// If this is a client_credentials grant, grant all requested scopes
-	// NewAccessRequest validated that all requested scopes the client is allowed to perform
-	// based on configured scope matching strategy.
-	if accessRequest.GetGrantTypes().ExactOne("client_credentials") {
-		for _, scope := range accessRequest.GetRequestedScopes() {
-			accessRequest.GrantScope(scope)
-		}
-	}
+	// client_credentials grant is intentionally not supported: the factory is
+	// not registered in compose.Compose(), and discovery does not advertise
+	// it. NewAccessRequest above rejects unsupported grant types before we
+	// reach this point.
 
 	// Next we create a response for the access request. Again, we iterate through the TokenEndpointHandlers
 	// and aggregate the result in response.

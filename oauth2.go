@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-jose/go-jose/v3"
@@ -24,6 +25,13 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
 )
+
+// registrationGuard tracks which *core.App values have an in-flight or
+// completed Register() call. LoadOrStore is atomic, which makes concurrent
+// Register() invocations on the same app race-free (in contrast to the
+// previous Get/Set sequence on app.Store(), which had a TOCTOU window
+// where both racers could pass the duplicate check and double-bind hooks).
+var registrationGuard sync.Map // key: core.App, value: struct{}{}
 
 type BaseConfig = fosite.Config
 
@@ -75,12 +83,16 @@ func cloneConfig(src *Config) *Config {
 }
 
 func Register(app core.App, config *Config) error {
-	if _, ok := app.Store().Get(registeringKey).(bool); ok {
+	// Atomic claim — sync.Map.LoadOrStore is race-free, unlike the prior
+	// Get-then-Set on app.Store(). Concurrent Register() calls on the
+	// same app collapse to one winner; losers see loaded == true and
+	// return the duplicate error without binding any hooks.
+	if _, loaded := registrationGuard.LoadOrStore(app, struct{}{}); loaded {
 		return errors.New("[Plugin/OAuth2] already registered for this app")
 	}
 
-	// Mark registration in progress so duplicate calls (even pre-bootstrap)
-	// are rejected before hooks are bound.
+	// Keep the legacy sentinel in app.Store() too; this is observable by
+	// any external code that already inspected it.
 	app.Store().Set(registeringKey, true)
 
 	// Clone config so per-app secrets and defaults are isolated.
@@ -145,7 +157,15 @@ func Register(app core.App, config *Config) error {
 			compose.OpenIDConnectRefreshFactory,
 		)
 
-		inst.metadata = buildProviderMetadata(app, inst.cfg)
+		metadata := buildProviderMetadata(app, inst.cfg)
+		// Merge any pre-bootstrap protected-resource scope registrations
+		// that arrived before inst.metadata existed.
+		inst.mu.Lock()
+		inst.metadata = metadata
+		for _, md := range inst.protected {
+			mergeProtectedScopes(inst.metadata, md.ScopesSupported)
+		}
+		inst.mu.Unlock()
 		return nil
 	}
 
@@ -267,9 +287,13 @@ func buildProviderMetadata(app core.App, cfg *Config) *openid.OpenIDProviderMeta
 			ResponseTypesSupported: []string{
 				"code",
 			},
+			// Client.GetResponseModes (client/client.go) allows
+			// default/fragment/form_post/query. Keep discovery aligned
+			// with what the client actually accepts.
 			ResponseModesSupported: []string{
 				"query",
 				"fragment",
+				"form_post",
 			},
 			// OAuth 2.1 alignment: "implicit" grant type removed.
 			GrantTypesSupported: []string{
@@ -351,6 +375,8 @@ func ResetGlobalStateForTests() {}
 // Use this in tests that need a clean slate.
 func ResetStateForTests(app core.App) {
 	app.Store().Remove(storeKey)
+	app.Store().Remove(registeringKey)
+	registrationGuard.Delete(app)
 }
 
 //
@@ -375,8 +401,11 @@ func bindOAuth2Handlers(inst *Instance, r *router.Router[*core.RequestEvent]) {
 	uiHandler := func(e *core.RequestEvent) error {
 		return e.FileFS(ui.DistDirFS, "login.html")
 	}
-	r.GET("/oauth2/login", uiHandler)
-	r.POST("/oauth2/login", uiHandler)
+	// Bind login under the configured PathPrefix so the redirect built in
+	// api_OAuth2Authorize (PathPrefix + "/login") resolves for non-default
+	// prefixes as well.
+	rg.GET("/login", uiHandler)
+	rg.POST("/login", uiHandler)
 }
 
 func bindOAuth2WellKnownHandlers(inst *Instance, r *router.Router[*core.RequestEvent]) {

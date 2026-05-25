@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"slices"
 
+	"github.com/ory/fosite"
 	"github.com/pkg/errors"
 	"github.com/pocketbase/pocketbase/core"
 )
@@ -325,17 +326,29 @@ var _ UserInfoClaimStrategy = (*DefaultUserInfoClaimStrategy)(nil)
 //
 
 func api_OAuth2UserInfo(e *core.RequestEvent, inst *Instance) error {
+	ctx := e.Request.Context()
 
-	// TODO: Support provided scopes to determine which claims to return.
-	//       For now we will just return all claims that we can populate
-	//       from the user record.
-	//
-	// TODO/conformance: The lack of scope support results in an OpenID Connect conformance
-	//                   warning. "EnsureUserInfoDoesNotContainName: Unexpectedly found
-	//                   name in userinfo response."
-	scopes := []string{"openid", "profile", "address", "email"}
+	// Resolve the granted scopes for this access token by looking the bearer
+	// up via fosite's IntrospectToken. This is what makes /userinfo OIDC-
+	// conformant: claims must be filtered by what was actually granted, not
+	// by what we hope was granted (per OIDC Core 1.0 §5.4 and the
+	// "EnsureUserInfoDoesNotContainName" conformance check).
+	var grantedScopes []string
+	if token := fosite.AccessTokenFromRequest(e.Request); token != "" {
+		sess := NewSession(e.App, "", "")
+		if _, ar, ierr := inst.provider.IntrospectToken(ctx, token, fosite.AccessToken, sess); ierr == nil && ar != nil {
+			grantedScopes = ar.GetGrantedScopes()
+		}
+	}
+	// Defensive fallback: if introspection failed (the rfc9728 middleware
+	// should have already rejected the request, but don't leak claims on the
+	// off chance it didn't) return only the subject by passing a scope set
+	// that opts no profile groups.
+	if len(grantedScopes) == 0 {
+		grantedScopes = []string{"openid"}
+	}
 
-	info, err := inst.cfg.UserInfoClaimStrategy.GetUserInfoClaims(e, scopes)
+	info, err := inst.cfg.UserInfoClaimStrategy.GetUserInfoClaims(e, grantedScopes)
 	if err != nil {
 		return e.InternalServerError("", errors.Wrap(err, "GetUserInfoClaims"))
 	}

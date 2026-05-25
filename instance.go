@@ -51,6 +51,10 @@ func RegisterProtectedResourceMetadata(app core.App, md *rfc9728.ProtectedResour
 
 // RegisterProtectedResourceMetadata registers a protected resource metadata
 // entry for this OAuth2 instance.
+//
+// Safe to call before app bootstrap: the entry is buffered in inst.protected
+// and the discovery metadata's ScopesSupported is merged later in loadParams
+// once inst.metadata exists.
 func (inst *Instance) RegisterProtectedResourceMetadata(md *rfc9728.ProtectedResourceMetadata) {
 	if !inst.cfg.EnableRFC9728ProtectedResourceMetadata {
 		return
@@ -63,9 +67,17 @@ func (inst *Instance) RegisterProtectedResourceMetadata(md *rfc9728.ProtectedRes
 	defer inst.mu.Unlock()
 
 	inst.protected[key] = md
-	for _, scope := range md.ScopesSupported {
-		if !slices.Contains(inst.metadata.ScopesSupported, scope) {
-			inst.metadata.ScopesSupported = append(inst.metadata.ScopesSupported, scope)
+	if inst.metadata != nil {
+		mergeProtectedScopes(inst.metadata, md.ScopesSupported)
+	}
+}
+
+// mergeProtectedScopes appends scopes that aren't already advertised in the
+// discovery metadata. Caller must hold inst.mu (or otherwise own metadata).
+func mergeProtectedScopes(md *openid.OpenIDProviderMetadata, scopes []string) {
+	for _, scope := range scopes {
+		if !slices.Contains(md.ScopesSupported, scope) {
+			md.ScopesSupported = append(md.ScopesSupported, scope)
 		}
 	}
 }
