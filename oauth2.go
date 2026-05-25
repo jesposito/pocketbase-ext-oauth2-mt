@@ -76,6 +76,25 @@ type Config struct {
 	// endpoint is reachable solely from a trusted network segment. Public
 	// deployments should always populate InitialAccessTokens instead.
 	AllowUnauthenticatedDynamicClientRegistration bool
+
+	// LoginRedirectURL — when non-empty, GET/POST /oauth2/login redirects
+	// (302) to this URL with the original query string (including
+	// interaction_id) appended. The destination page is the consumer's
+	// responsibility to render: authenticate the user against the right
+	// collection, then POST back to /oauth2/login/complete with the
+	// obtained pb_token + decision + consented_scopes.
+	//
+	// Empty (default) — the bundled plugin UI at /oauth2/login is served.
+	//
+	// This is the integration hook that lets a multi-tenant host re-use
+	// its own branded /members/login or /admin/login flow instead of
+	// presenting end users with two distinct login screens.
+	//
+	// Relative URLs ("/members/login") and absolute URLs
+	// ("https://other.host/login") are both honored. The plugin does NOT
+	// validate the destination — the consumer is trusted to point at a
+	// page it controls.
+	LoginRedirectURL string
 }
 
 // GetOAuth2Config returns the Config for the OP registered at
@@ -632,8 +651,22 @@ func bindOAuth2Handlers(inst *Instance, r *router.Router[*core.RequestEvent]) {
 	if inst.cfg.EnableRFC7591DynamicClientRegistration {
 		rg.POST("/register", func(e *core.RequestEvent) error { return api_OAuth2Register(e, inst) })
 	}
-	// ui
+	// ui — bundled by default. When Config.LoginRedirectURL is set, the
+	// handler redirects to the consumer-provided URL with the original
+	// query string preserved so the destination page can fetch
+	// /oauth2/login/state and render its own branded consent screen.
 	uiHandler := func(e *core.RequestEvent) error {
+		if inst.cfg.LoginRedirectURL != "" {
+			dest := inst.cfg.LoginRedirectURL
+			if rawQ := e.Request.URL.RawQuery; rawQ != "" {
+				sep := "?"
+				if strings.Contains(dest, "?") {
+					sep = "&"
+				}
+				dest = dest + sep + rawQ
+			}
+			return e.Redirect(http.StatusFound, dest)
+		}
 		return e.FileFS(ui.DistDirFS, "login.html")
 	}
 	// Bind login under the configured PathPrefix so the redirect built in
