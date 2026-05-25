@@ -14,7 +14,7 @@ import (
 	"github.com/go-jose/go-jose/v3"
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/compose"
-	"github.com/pkg/errors"
+	"errors"
 
 	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
 	_ "github.com/jesposito/pocketbase-ext-oauth2-mt/migrations"
@@ -51,6 +51,31 @@ type Config struct {
 	// When the provider returns a nil master, encryption is disabled
 	// and values are stored in legacy plaintext form (dev / back-compat).
 	MasterKeyProvider MasterKeyProvider
+
+	// DynamicClientRegistrationInitialAccessTokens, when EnableRFC7591…
+	// is true, gates the /oauth2/register endpoint behind RFC 7591 §3
+	// Initial Access Tokens. Each entry is a bearer token operators must
+	// hand out to legitimate registration callers. Requests without an
+	// Authorization: Bearer <token> header matching one of these values
+	// are rejected with 401.
+	//
+	// Nil OR empty disables the gate, BUT the plugin then refuses to
+	// register the /register route at all unless
+	// AllowUnauthenticatedDynamicClientRegistration is also set (a loud
+	// opt-in for development environments where rate-limit + network
+	// boundary already gate the endpoint).
+	DynamicClientRegistrationInitialAccessTokens []string
+
+	// AllowUnauthenticatedDynamicClientRegistration acknowledges that DCR
+	// is intentionally exposed with no Initial Access Token requirement.
+	// REQUIRED when EnableRFC7591DynamicClientRegistration is true and
+	// DynamicClientRegistrationInitialAccessTokens is empty; otherwise
+	// the /register route is silently NOT bound.
+	//
+	// Use only in development or in environments where the registration
+	// endpoint is reachable solely from a trusted network segment. Public
+	// deployments should always populate InitialAccessTokens instead.
+	AllowUnauthenticatedDynamicClientRegistration bool
 }
 
 func GetOAuth2Config(app core.App) *Config {
@@ -180,6 +205,20 @@ func Register(app core.App, config *Config) error {
 		config.EnforcePKCE = true
 	}
 
+	// RFC 7591 DCR safety gate: refuse to register when DCR is enabled
+	// but neither Initial Access Tokens nor the explicit
+	// AllowUnauthenticatedDynamicClientRegistration opt-in is set. Fail
+	// closed; the alternative is exposing /oauth2/register to the world.
+	if config.EnableRFC7591DynamicClientRegistration &&
+		len(config.DynamicClientRegistrationInitialAccessTokens) == 0 &&
+		!config.AllowUnauthenticatedDynamicClientRegistration {
+		// Roll back the registrationGuard claim so a corrected config
+		// can re-attempt registration without restarting the process.
+		registrationGuard.Delete(app)
+		app.Store().Remove(registeringKey)
+		return errors.New("[Plugin/OAuth2] EnableRFC7591DynamicClientRegistration is on but no Initial Access Tokens are configured and AllowUnauthenticatedDynamicClientRegistration is false — refusing to expose an unauthenticated /register endpoint")
+	}
+
 	inst := &Instance{
 		cfg:       config,
 		protected: map[string]*rfc9728.ProtectedResourceMetadata{},
@@ -305,6 +344,7 @@ func Register(app core.App, config *Config) error {
 			consts.PKCECollectionName,
 			consts.OpenIDConnectCollectionName,
 			consts.JTICollectionName,
+			consts.InteractionCollectionName,
 		} {
 			records, err := app.FindAllRecords(
 				collection,
@@ -456,6 +496,23 @@ func ResetGlobalStateForTests() {}
 // ResetStateForTests removes the OAuth2 instance from the app's store.
 // Use this in tests that need a clean slate.
 func ResetStateForTests(app core.App) {
+	Deregister(app)
+}
+
+// Deregister removes the plugin's per-app state from the given core.App
+// and clears the registrationGuard entry. Use this in long-running
+// processes that create and destroy tenant apps dynamically — otherwise
+// registrationGuard accumulates stale interface-value entries for the
+// lifetime of the process.
+//
+// After Deregister, Register may be called again on the same app value.
+// HTTP handlers and cron jobs already bound to the app remain bound; this
+// only releases the plugin's bookkeeping state. For full teardown, drop
+// the core.App itself.
+func Deregister(app core.App) {
+	if app == nil {
+		return
+	}
 	app.Store().Remove(storeKey)
 	app.Store().Remove(registeringKey)
 	registrationGuard.Delete(app)
@@ -476,6 +533,11 @@ func bindOAuth2Handlers(inst *Instance, r *router.Router[*core.RequestEvent]) {
 	// rfc7591
 	// Dynamic Client Registration
 	// @ref https://datatracker.ietf.org/doc/html/rfc7591
+	//
+	// Route binding is gated AT REGISTRATION TIME (see Register) so a
+	// misconfigured deployment fails to boot rather than silently
+	// exposing an unauthenticated /register endpoint. By the time we
+	// reach this code we already know the configuration is safe.
 	if inst.cfg.EnableRFC7591DynamicClientRegistration {
 		rg.POST("/register", func(e *core.RequestEvent) error { return api_OAuth2Register(e, inst) })
 	}
@@ -488,6 +550,15 @@ func bindOAuth2Handlers(inst *Instance, r *router.Router[*core.RequestEvent]) {
 	// prefixes as well.
 	rg.GET("/login", uiHandler)
 	rg.POST("/login", uiHandler)
+
+	// lr7 + mci: server-owned interaction store. /login/state gives the
+	// UI metadata for a pending interaction (no browser-controlled state
+	// blob), /login/complete consumes the pending interaction and runs
+	// the actual fosite authorize handshake using server-stored params.
+	rg.GET("/login/state", func(e *core.RequestEvent) error { return api_OAuth2LoginState(e, inst) })
+	rg.OPTIONS("/login/state", func(e *core.RequestEvent) error { return api_OAuth2LoginState(e, inst) })
+	rg.POST("/login/complete", func(e *core.RequestEvent) error { return api_OAuth2LoginComplete(e, inst) })
+	rg.OPTIONS("/login/complete", func(e *core.RequestEvent) error { return api_OAuth2LoginComplete(e, inst) })
 }
 
 func bindOAuth2WellKnownHandlers(inst *Instance, r *router.Router[*core.RequestEvent]) {

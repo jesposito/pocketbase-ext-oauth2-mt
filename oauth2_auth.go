@@ -2,13 +2,12 @@ package oauth2
 
 import (
 	"context"
-	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -17,9 +16,19 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 )
 
+// cloneForm returns a deep copy of a url.Values so callers can mutate
+// the result without affecting the original (e.g. stripping pb_token
+// before persisting an Interaction).
+func cloneForm(in url.Values) url.Values {
+	out := make(url.Values, len(in))
+	for k, vs := range in {
+		out[k] = append([]string(nil), vs...)
+	}
+	return out
+}
+
 func api_OAuth2Authorize(e *core.RequestEvent, inst *Instance) error {
 	r := e.Request
-	w := e.Response
 	ctx := r.Context()
 
 	_ = r.ParseForm()
@@ -38,10 +47,6 @@ func api_OAuth2Authorize(e *core.RequestEvent, inst *Instance) error {
 		return nil
 	}
 	// You have now access to authorizeRequest, Code ResponseTypes, Scopes ...
-
-	var u *core.Record
-	var issuedAt time.Time
-	var requestedAt time.Time
 
 	if err := ar.GetRequestForm().Get("error"); err != "" {
 		switch err {
@@ -62,126 +67,49 @@ func api_OAuth2Authorize(e *core.RequestEvent, inst *Instance) error {
 		return nil
 	}
 
-	if token := ar.GetRequestForm().Get("pb_token"); len(token) > 0 {
-		if u, err = e.App.FindAuthRecordByToken(token); err != nil {
-			if !errors.Is(err, sql.ErrNoRows) {
-				return e.InternalServerError("Internal Error", err)
-			}
-		}
-	}
-
-	if tokenIat := ar.GetRequestForm().Get("pb_token_iat"); len(tokenIat) > 0 {
-		if iatInt, err := strconv.ParseInt(tokenIat, 10, 64); err == nil {
-			issuedAt = time.Unix(iatInt, 0).In(time.UTC)
-		}
-	}
-
+	// lr7: the authorize endpoint NEVER consumes a pb_token from the
+	// request form. The previous design accepted it here, which combined
+	// with a browser-controlled `state` parameter allowed token
+	// exfiltration. Authentication is now strictly server-mediated
+	// through /oauth2/login/complete, which sources the redirect_uri and
+	// scopes from a server-stored Interaction.
+	requestedAt := ar.GetRequestedAt()
 	if rat := ar.GetRequestForm().Get("rat"); len(rat) > 0 {
 		if ratInt, err := strconv.ParseInt(rat, 10, 64); err == nil {
 			requestedAt = time.Unix(ratInt, 0).In(time.UTC)
 		}
 	}
-	if requestedAt.IsZero() {
-		requestedAt = ar.GetRequestedAt()
-	}
-
+	// Strip any inbound pb_token attempt so a malicious form param can't
+	// re-enter the legacy path if any future code reads it.
 	ar.GetRequestForm().Del("pb_token")
 	ar.GetRequestForm().Del("pb_token_iat")
-
 	if !ar.GetRequestForm().Has("rat") {
 		ar.GetRequestForm().Set("rat", strconv.FormatInt(requestedAt.Unix(), 10))
 	}
 
-	if u == nil {
-		c, _ := ar.GetClient().(*client.Client)
-		state := map[string]any{
-			"collection":       inst.cfg.UserCollection,
-			"client_id":        c.ID,
-			"client_name":      c.Name,
-			"client_uri":       c.ClientURI,
-			"prompt":           ar.GetRequestForm().Get("prompt"),
-			"max_age":          ar.GetRequestForm().Get("max_age"),
-			"login_hint":       ar.GetRequestForm().Get("login_hint"),
-			"requested_scopes": ar.GetRequestedScopes(),
-			"redirect_uri":     e.App.Settings().Meta.AppURL + inst.cfg.PathPrefix + "/auth?" + ar.GetRequestForm().Encode(),
-		}
-		// Base64-URL encode the state to make it safe for URL usage.
-		stateBytes, _ := json.Marshal(state)
-		stateB64Str := base64.RawURLEncoding.EncodeToString(stateBytes)
-		return e.Redirect(http.StatusTemporaryRedirect, e.App.Settings().Meta.AppURL+inst.cfg.PathPrefix+"/login?state="+stateB64Str)
+	// Store the pending authorization server-side and redirect to /login
+	// carrying ONLY an opaque interaction id. The UI looks up state via
+	// /login/state and completes via /login/complete. No browser-
+	// controlled redirect_uri ever reaches the token-exchange path.
+	c, _ := ar.GetClient().(*client.Client)
+	formCopy := cloneForm(ar.GetRequestForm())
+	formCopy.Del("pb_token")
+	formCopy.Del("pb_token_iat")
+	interactionID, ierr := CreateInteraction(e.App, &Interaction{
+		ClientID:        c.ID,
+		ClientName:      c.Name,
+		UserCollection:  inst.cfg.UserCollection,
+		RedirectURI:     c.GetRedirectURIs()[0],
+		RequestForm:     formCopy,
+		RequestedScopes: ar.GetRequestedScopes(),
+		Prompt:          ar.GetRequestForm().Get("prompt"),
+		RequestedAt:     requestedAt,
+	})
+	if ierr != nil {
+		return e.InternalServerError("failed to create interaction", ierr)
 	}
-
-	// Check if the user belongs to the expected collection. This is optional,
-	// but it can be a good way to ensure that the login hasn't been tampered
-	// with.
-
-	if u.Collection().Name != inst.cfg.UserCollection {
-		return e.BadRequestError("Invalid user collection", nil)
-	}
-
-	// At this point, the user is authenticated and we can grant the requested scopes.
-
-	for _, scope := range ar.GetRequestedScopes() {
-		ar.GrantScope(scope)
-	}
-	// Grant the requested audiences as well. Without this, the session
-	// persists granted_audience as empty, and any downstream audience
-	// validation (RFC 8707, resource indicators) sees no granted scope.
-	// fosite has already validated that requested audiences are allowed
-	// for this client via its AudienceMatchingStrategy.
-	for _, aud := range ar.GetRequestedAudience() {
-		ar.GrantAudience(aud)
-	}
-
-	// Now that the user is authorized, we set up a session:
-	mySessionData := NewSession(e.App, u.Id, u.Collection().Id)
-	mySessionData.Claims.AuthTime = issuedAt
-	mySessionData.Claims.RequestedAt = requestedAt
-
-	var loa int = 1  // Level of Assurance (LOA)
-	var amr []string // Authentication Methods References (AMR)
-	if u.Collection().PasswordAuth.Enabled {
-		amr = append(amr, "pwd")
-	}
-	if u.Collection().OTP.Enabled {
-		amr = append(amr, "otp")
-	}
-	if u.Collection().MFA.Enabled {
-		loa += 1
-		amr = append(amr, "mfa")
-	}
-	mySessionData.Claims.AuthenticationMethodsReferences = amr
-	mySessionData.Claims.AuthenticationContextClassReference = fmt.Sprintf("loa%d", loa)
-
-	// Now we need to get a response. This is the place where the AuthorizeEndpointHandlers kick in and start processing the request.
-	// NewAuthorizeResponse is capable of running multiple response type handlers which in turn enables this library
-	// to support open id connect.
-	response, err := inst.provider.NewAuthorizeResponse(ctx, ar, mySessionData)
-
-	// Catch any errors, e.g.:
-	// * unknown client
-	// * invalid redirect
-	// * ...
-	if err != nil {
-		e.App.Logger().Info("[Plugin/OAuth2] Error occurred in NewAuthorizeResponse", slog.Any("error", err))
-		var rfc6749err *fosite.RFC6749Error
-		if errors.As(err, &rfc6749err) {
-			e.App.Logger().Debug(fmt.Sprintf("[Plugin/OAuth2] %s", rfc6749err.DebugField))
-			e.App.Logger().Debug(fmt.Sprintf("[Plugin/OAuth2] %+v", rfc6749err.StackTrace()))
-		}
-		writeAuthorizeErrorWithIss(ctx, e, inst, ar, err)
-		return nil
-	}
-
-	// RFC 9207 — Authorization Response Issuer Identification. Include
-	// "iss" in every authorization response so clients can detect
-	// mix-up attacks. Advertised via
-	// authorization_response_iss_parameter_supported in discovery.
-	response.AddParameter("iss", e.App.Settings().Meta.AppURL)
-
-	// Last but not least, send the response!
-	inst.provider.WriteAuthorizeResponse(ctx, w, ar, response)
-	return nil
+	return e.Redirect(http.StatusTemporaryRedirect,
+		e.App.Settings().Meta.AppURL+inst.cfg.PathPrefix+"/login?interaction_id="+interactionID)
 }
 
 // writeAuthorizeErrorWithIss writes a fosite authorize error response with

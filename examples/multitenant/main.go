@@ -83,6 +83,7 @@ func runTenant(tc tenantConfig) error {
 		PathPrefix:                             "/oauth2",
 		UserCollection:                         "users",
 		EnableRFC7591DynamicClientRegistration: true,
+		AllowUnauthenticatedDynamicClientRegistration: true,
 		EnableRFC9728ProtectedResourceMetadata: true,
 	})
 

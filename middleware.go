@@ -1,6 +1,7 @@
 package oauth2
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -70,7 +71,9 @@ func RequireScope(app core.App, requiredScopes ...string) *hook.Handler[*core.Re
 			if ierr != nil || ar == nil || tu != fosite.AccessToken {
 				desc := "The access token provided is expired, revoked, malformed, or invalid for other reasons."
 				if ierr != nil {
-					desc = sanitizeHeaderValue(ierr.Error())
+					// %q already escapes embedded quotes + control chars
+					// safely for an RFC 7230 quoted-string parameter value.
+					desc = ierr.Error()
 				} else if ar != nil && tu != fosite.AccessToken {
 					desc = "The presented token is not an access token."
 				}
@@ -113,11 +116,54 @@ func writeWWWAuthenticate(e *core.RequestEvent, status int, challenge string) {
 	e.Response.WriteHeader(status)
 }
 
-// sanitizeHeaderValue strips CR/LF and double-quote characters so the value
-// can be safely embedded in a quoted-string header parameter.
-func sanitizeHeaderValue(v string) string {
-	r := strings.NewReplacer("\r", " ", "\n", " ", `"`, "'")
-	return r.Replace(v)
+// RevokedTokenGuard returns a router middleware that rejects bearer
+// tokens which have no corresponding _oauth2Access row — i.e. tokens
+// that were revoked via /oauth2/revoke or expired by the cleanup cron.
+//
+// PocketBase native auth tokens are stateless JWTs validated against the
+// PB signing secret; a revoked OAuth2 access token remains a syntactically
+// valid PB token until its natural exp. Routes using apis.RequireAuth()
+// alone will accept revoked tokens. Bind RevokedTokenGuard wherever you
+// need OAuth-side revocation to take effect on a PB-native route:
+//
+//	se.Router.GET("/api/private", privateHandler).
+//	    Bind(apis.RequireAuth("users")).
+//	    Bind(oauth2.RevokedTokenGuard(app))
+//
+// Tokens issued outside the OAuth flow (e.g. PB built-in auth via
+// /api/collections/users/auth-with-password) have no _oauth2Access row
+// and would also be rejected by this middleware — by design. Use it only
+// on routes that should accept ONLY OAuth-issued tokens.
+func RevokedTokenGuard(app core.App) *hook.Handler[*core.RequestEvent] {
+	return &hook.Handler[*core.RequestEvent]{
+		Func: func(e *core.RequestEvent) error {
+			token := bearerTokenFromHeader(e.Request.Header.Get("Authorization"))
+			if token == "" {
+				writeWWWAuthenticate(e, http.StatusUnauthorized,
+					`Bearer realm="OAuth", error="invalid_token", error_description="The access token is missing or malformed."`)
+				return nil
+			}
+			parts := strings.Split(token, ".")
+			if len(parts) != 3 {
+				writeWWWAuthenticate(e, http.StatusUnauthorized,
+					`Bearer realm="OAuth", error="invalid_token", error_description="The presented token is not an OAuth access token."`)
+				return nil
+			}
+			signature := parts[2]
+			if _, err := findSessionModelBySignature(app, &AccessTokenModel{}, signature); err != nil {
+				if errors.Is(err, fosite.ErrNotFound) {
+					writeWWWAuthenticate(e, http.StatusUnauthorized,
+						`Bearer realm="OAuth", error="invalid_token", error_description="The access token has been revoked or expired."`)
+					return nil
+				}
+				writeWWWAuthenticate(e, http.StatusUnauthorized,
+					`Bearer realm="OAuth", error="invalid_token", error_description="Failed to validate access token."`)
+				return nil
+			}
+			return e.Next()
+		},
+		Priority: apis.DefaultLoadAuthTokenMiddlewarePriority + 10,
+	}
 }
 
 // bearerTokenFromHeader extracts a bearer token from an Authorization header

@@ -11,10 +11,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 
-	"github.com/pkg/errors"
+	"errors"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -96,7 +97,7 @@ func (envMasterKeyProvider) Master(_ context.Context) ([]byte, error) {
 	}
 	key, err := decodeMasterKey(raw)
 	if err != nil {
-		return nil, errors.Wrap(err, "invalid OAUTH2_MASTER_KEY")
+		return nil, fmt.Errorf("invalid OAUTH2_MASTER_KEY: %w", err)
 	}
 	return key, nil
 }
@@ -154,7 +155,13 @@ func (p envMasterKeyProvider) Keyring(ctx context.Context) (map[string][]byte, e
 func decodeMasterKey(raw string) ([]byte, error) {
 	// Raw 32-byte short-circuit. A literal 32-byte secret is len==32,
 	// which cannot collide with the encoded forms (hex=64, base64>=43).
+	// Guard against low-entropy passphrases: a 32-char ASCII memorable
+	// password has far less than 256 bits of entropy and silently
+	// accepting it would gut the at-rest encryption strength.
 	if len(raw) == 32 {
+		if err := requireHighEntropy([]byte(raw)); err != nil {
+			return nil, err
+		}
 		return []byte(raw), nil
 	}
 	// Try hex when it looks hex-shaped (64 chars, all hex).
@@ -180,6 +187,63 @@ func decodeMasterKey(raw string) ([]byte, error) {
 		}
 	}
 	return nil, errors.New("master key must be 32 bytes as raw string, base64, or hex")
+}
+
+// requireHighEntropy rejects 32-byte master-key candidates that look like
+// a memorable passphrase rather than cryptographic random output. The
+// heuristic is a hybrid: any 32-byte value that is entirely printable
+// ASCII (0x20-0x7E) is rejected, since 32 random bytes have ~99.99%
+// probability of containing at least one non-printable byte
+// (1 - (95/256)^32). For mixed input, a low Shannon-entropy floor catches
+// repeated-byte patterns. Neither check substitutes for "use openssl
+// rand"; together they catch the most common operator footgun (typing a
+// memorable password into OAUTH2_MASTER_KEY because the docs said "raw
+// 32 bytes are accepted").
+func requireHighEntropy(b []byte) error {
+	if len(b) == 0 {
+		return errors.New("empty master key")
+	}
+
+	allPrintable := true
+	for _, x := range b {
+		if x < 0x20 || x > 0x7E {
+			allPrintable = false
+			break
+		}
+	}
+	if allPrintable {
+		return errors.New(
+			"OAUTH2_MASTER_KEY looks like a printable-ASCII passphrase, not a random key. " +
+				"Generate a real key with: openssl rand -base64 32",
+		)
+	}
+
+	// Belt-and-suspenders: catch low-distinct-byte inputs (e.g. all-zero
+	// or repeated-pattern keys), which the printable-ASCII test misses.
+	// On a 32-byte uniform-random sample we expect ~4.7 bits/byte; 2.5 is
+	// far below the worst random output yet well above all-one-byte (0)
+	// and short-repeating patterns (<1.5).
+	var counts [256]int
+	for _, x := range b {
+		counts[x]++
+	}
+	n := float64(len(b))
+	h := 0.0
+	for _, c := range counts {
+		if c == 0 {
+			continue
+		}
+		p := float64(c) / n
+		h -= p * math.Log2(p)
+	}
+	if h < 2.5 {
+		return fmt.Errorf(
+			"OAUTH2_MASTER_KEY has very low byte-entropy (%.2f bits/byte) — looks like a repeated pattern, not a random key. "+
+				"Generate a real key with: openssl rand -base64 32",
+			h,
+		)
+	}
+	return nil
 }
 
 // fingerprintOf returns the short fingerprint used for the mismatch guard.
@@ -232,7 +296,7 @@ func deriveDEK(master []byte, ctxID, paramID string) ([]byte, error) {
 	r := hkdf.New(sha256.New, master, nil, info)
 	dek := make([]byte, 32)
 	if _, err := io.ReadFull(r, dek); err != nil {
-		return nil, errors.Wrap(err, "hkdf expand failed")
+		return nil, fmt.Errorf("hkdf expand failed: %w", err)
 	}
 	return dek, nil
 }
@@ -248,15 +312,15 @@ func sealEnvelope(master []byte, ctxID, paramID string, plaintext []byte) ([]byt
 	}
 	block, err := aes.NewCipher(dek)
 	if err != nil {
-		return nil, errors.Wrap(err, "aes.NewCipher failed")
+		return nil, fmt.Errorf("aes.NewCipher failed: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, errors.Wrap(err, "cipher.NewGCM failed")
+		return nil, fmt.Errorf("cipher.NewGCM failed: %w", err)
 	}
 	nonce := make([]byte, gcm.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
-		return nil, errors.Wrap(err, "nonce generation failed")
+		return nil, fmt.Errorf("nonce generation failed: %w", err)
 	}
 	ct := gcm.Seal(nil, nonce, plaintext, nil)
 	env := envelope{
@@ -279,26 +343,26 @@ func openEnvelope(master []byte, ctxID, paramID string, env *envelope) ([]byte, 
 	}
 	block, err := aes.NewCipher(dek)
 	if err != nil {
-		return nil, errors.Wrap(err, "aes.NewCipher failed")
+		return nil, fmt.Errorf("aes.NewCipher failed: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, errors.Wrap(err, "cipher.NewGCM failed")
+		return nil, fmt.Errorf("cipher.NewGCM failed: %w", err)
 	}
 	nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
 	if err != nil {
-		return nil, errors.Wrap(err, "invalid nonce in envelope")
+		return nil, fmt.Errorf("invalid nonce in envelope: %w", err)
 	}
 	if len(nonce) != gcm.NonceSize() {
 		return nil, fmt.Errorf("nonce length = %d, want %d", len(nonce), gcm.NonceSize())
 	}
 	ct, err := base64.StdEncoding.DecodeString(env.CT)
 	if err != nil {
-		return nil, errors.Wrap(err, "invalid ciphertext in envelope")
+		return nil, fmt.Errorf("invalid ciphertext in envelope: %w", err)
 	}
 	pt, err := gcm.Open(nil, nonce, ct, nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "envelope decryption failed (wrong key or corrupted data)")
+		return nil, fmt.Errorf("envelope decryption failed (wrong key or corrupted data): %w", err)
 	}
 	return pt, nil
 }

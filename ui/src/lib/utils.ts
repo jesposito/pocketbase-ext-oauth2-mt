@@ -28,42 +28,66 @@ export function sentenize(str: string, stopCheck = true): string {
 }
 
 /**
-* Redirects to a specified URL using a POST request with provided data.
-* @param {string} location The target URL.
-* @param {object} data The data to be sent as key-value pairs.
-*/
-export function postRedirect(location: string, data: Record<string, any>): void {
-    // Create a form element
-    const form = document.createElement('form');
-    form.method = 'POST';
-    form.action = location;
-    form.style.display = 'none'; // Hide the form from the user
-
-    // Append hidden input fields for the data
-    for (const key in data) {
-        if (Object.prototype.hasOwnProperty.call(data, key)) {
-            const input = document.createElement('input');
-            input.type = 'hidden';
-            input.name = key;
-            input.value = data[key];
-            form.appendChild(input);
-        }
+ * Completes a pending OAuth2 interaction by POSTing JSON to the
+ * server-controlled /oauth2/login/complete endpoint, then navigates the
+ * browser to the redirect_uri the server returns.
+ *
+ * IMPORTANT (lr7): the browser never decides where to navigate. The
+ * server's stored Interaction holds the canonical redirect_uri; we just
+ * follow whatever JSON we get back. A malicious /login URL therefore
+ * cannot make the UI POST credentials anywhere except this same-origin
+ * server endpoint.
+ */
+export async function completeInteraction(
+    pathPrefix: string,
+    payload: {
+        interaction_id: string;
+        pb_token?: string;
+        pb_token_iat?: number;
+        decision: "approve" | "deny";
+        consented_scopes?: string[];
     }
-
-    // Append the form to the document body and submit it
-    document.body.appendChild(form);
-    form.submit();
-    // Optional: remove the form after submission
-    // document.body.removeChild(form); 
+): Promise<void> {
+    const resp = await fetch(`${pathPrefix}/login/complete`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(`login/complete failed: ${resp.status} ${txt}`);
+    }
+    const data = await resp.json();
+    if (!data.redirect_uri) {
+        throw new Error("login/complete returned no redirect_uri");
+    }
+    window.location.assign(String(data.redirect_uri));
 }
 
-export function base64UrlDecode(base64UrlString: string): string {
-    let base64 = base64UrlString.replace(/-/g, "+").replace(/_/g, "/");
-    while (base64.length % 4) {
-        base64 += "=";
+/**
+ * Fetches the server-side metadata for a pending Interaction. The UI
+ * uses the returned scopes / client name to render the consent screen.
+ */
+export async function fetchInteractionState(
+    pathPrefix: string,
+    interactionID: string
+): Promise<{
+    client_id: string;
+    client_name: string;
+    user_collection: string;
+    requested_scopes: string[];
+    granted_scopes: string[];
+    prompt: string;
+    expires_at: number;
+}> {
+    const resp = await fetch(
+        `${pathPrefix}/login/state?id=${encodeURIComponent(interactionID)}`,
+        { credentials: "same-origin" }
+    );
+    if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(`login/state failed: ${resp.status} ${txt}`);
     }
-    const decodedBinaryString = atob(base64);
-    const utf8Bytes = Uint8Array.from(decodedBinaryString, (c) => c.charCodeAt(0));
-    const decodedString = new TextDecoder().decode(utf8Bytes);
-    return decodedString;
+    return resp.json();
 }

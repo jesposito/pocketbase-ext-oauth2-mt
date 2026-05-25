@@ -191,6 +191,81 @@ func TestRequireScope_FormBodyToken_Rejected(t *testing.T) {
 	}
 }
 
+// TestRevokedTokenGuard_AllowsLiveRejectsRevoked locks in wg6: the guard
+// admits requests whose token has a live _oauth2Access row and rejects
+// requests whose row was deleted (revoked or expired by cleanup).
+func TestRevokedTokenGuard_AllowsLiveRejectsRevoked(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+	seedTestUser(t, app)
+	seedTestClient(t, app)
+
+	bearer := mintBearerForUser(t, app)
+	seedAccessTokenRow(t, app, bearer, "openid")
+
+	mw := oauth2.RevokedTokenGuard(app)
+
+	// Live token → pass-through.
+	{
+		req := httptest.NewRequest(http.MethodGet, "/p", nil)
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		rec := httptest.NewRecorder()
+		e := &core.RequestEvent{App: app}
+		e.Request = req
+		e.Response = rec
+		if err := mw.Func(e); err != nil {
+			t.Fatalf("middleware err: %v", err)
+		}
+		if rec.Code != 200 && rec.Code != 0 {
+			t.Fatalf("expected pass-through, got %d", rec.Code)
+		}
+	}
+
+	// Simulate revocation: delete the access-token row.
+	parts := strings.Split(bearer, ".")
+	sig := parts[2]
+	if _, err := app.DB().NewQuery("DELETE FROM " + consts.AccessCollectionName + " WHERE signature = {:sig}").
+		Bind(map[string]any{"sig": sig}).Execute(); err != nil {
+		t.Fatalf("delete access row: %v", err)
+	}
+
+	// Revoked token → 401.
+	req := httptest.NewRequest(http.MethodGet, "/p", nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	rec := httptest.NewRecorder()
+	e := &core.RequestEvent{App: app}
+	e.Request = req
+	e.Response = rec
+	if err := mw.Func(e); err != nil {
+		t.Fatalf("middleware err: %v", err)
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after revocation, got %d", rec.Code)
+	}
+	wa := rec.Header().Get("WWW-Authenticate")
+	if !strings.Contains(wa, "revoked or expired") {
+		t.Errorf("WWW-Authenticate should mention revocation, got %q", wa)
+	}
+}
+
+func TestRevokedTokenGuard_NoToken_Returns401(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+
+	mw := oauth2.RevokedTokenGuard(app)
+	req := httptest.NewRequest(http.MethodGet, "/p", nil)
+	rec := httptest.NewRecorder()
+	e := &core.RequestEvent{App: app}
+	e.Request = req
+	e.Response = rec
+	if err := mw.Func(e); err != nil {
+		t.Fatalf("middleware err: %v", err)
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for missing bearer, got %d", rec.Code)
+	}
+}
+
 func TestRequireScope_AllScopesGranted_PassesThrough(t *testing.T) {
 	app := setupTestApp(t)
 	defer app.Cleanup()

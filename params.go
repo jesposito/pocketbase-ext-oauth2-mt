@@ -10,7 +10,8 @@ import (
 
 	"github.com/go-jose/go-jose/v3"
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
+	"fmt"
+	"errors"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/types"
@@ -62,7 +63,7 @@ func getOrCreateEnvelopeContext(app core.App) (string, error) {
 	if err == nil {
 		var stored string
 		if uerr := json.Unmarshal(param.Value, &stored); uerr != nil {
-			return "", errors.Wrap(uerr, "failed to parse stored envelope ctx id")
+			return "", fmt.Errorf("failed to parse stored envelope ctx id: %w", uerr)
 		}
 		if stored == "" {
 			return "", errors.New("stored envelope ctx id is empty")
@@ -70,7 +71,7 @@ func getOrCreateEnvelopeContext(app core.App) (string, error) {
 		return stored, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return "", errors.Wrap(err, "failed to query envelope ctx id")
+		return "", fmt.Errorf("failed to query envelope ctx id: %w", err)
 	}
 	// Generate and persist a new UUID.
 	id := uuid.NewString()
@@ -89,10 +90,18 @@ func getOrCreateEnvelopeContext(app core.App) (string, error) {
 				return stored, nil
 			}
 		}
-		return "", errors.Wrap(serr, "failed to persist envelope ctx id")
+		return "", fmt.Errorf("failed to persist envelope ctx id: %w", serr)
 	}
 	return id, nil
 }
+
+// rsaSigningKeyBits is the RSA modulus size for the OAuth2/OIDC signing
+// key. 3072 bits provides ~128-bit equivalent security per NIST SP 800-57
+// and is the recommended size for keys with multi-year operational
+// lifetimes. Existing 2048-bit keys persisted in _params keep working —
+// only freshly-generated keys use the new size; operators rotating to 3072
+// must delete the oauth2_rsa_key row to trigger regeneration on next boot.
+const rsaSigningKeyBits = 3072
 
 // loadPrivateKeyFromAppStorage loads the private JSON-Web-Key from the app storage or generates
 // a new one if it doesn't exist. The key is used for signing the OpenID Connect ID tokens and
@@ -101,9 +110,9 @@ func getOrCreateEnvelopeContext(app core.App) (string, error) {
 func loadPrivateKeyFromAppStorage(app core.App) (*jose.JSONWebKey, error) {
 	return loadParamFromAppStorage(app, paramsKeyOAuth2RSAKey, &jose.JSONWebKey{}, func() (*jose.JSONWebKey, error) {
 		// No existing key found, generate a new one
-		privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		privateKey, err := rsa.GenerateKey(rand.Reader, rsaSigningKeyBits)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to generate new RSA key")
+			return nil, fmt.Errorf("failed to generate new RSA key: %w", err)
 		}
 		// Build the JWK from the generated private key
 		return &jose.JSONWebKey{
@@ -141,7 +150,7 @@ func encodePlaintext[T any](value T) ([]byte, error) {
 	default:
 		b, err := json.Marshal(value)
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to marshal value")
+			return nil, fmt.Errorf("failed to marshal value: %w", err)
 		}
 		return b, nil
 	}
@@ -154,12 +163,12 @@ func decodePlaintext[T any](raw []byte, value T) (T, error) {
 	case []byte:
 		decoded, err := hex.DecodeString(string(raw))
 		if err != nil {
-			return zero, errors.Wrap(err, "failed to decode value")
+			return zero, fmt.Errorf("failed to decode value: %w", err)
 		}
 		return any(decoded).(T), nil
 	default:
 		if err := json.Unmarshal(raw, &value); err != nil {
-			return zero, errors.Wrap(err, "failed to unmarshal value")
+			return zero, fmt.Errorf("failed to unmarshal value: %w", err)
 		}
 		return value, nil
 	}
@@ -188,7 +197,7 @@ func verifyOrWriteFingerprint(app core.App, master []byte, provider MasterKeyPro
 	err := app.ModelQuery(param).Model(fingerprintParamID, param)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			return errors.Wrap(err, "failed to query master key fingerprint")
+			return fmt.Errorf("failed to query master key fingerprint: %w", err)
 		}
 		// First run with encryption enabled: record the fingerprint.
 		row := &core.Param{}
@@ -197,13 +206,13 @@ func verifyOrWriteFingerprint(app core.App, master []byte, provider MasterKeyPro
 		row.Updated = row.Created
 		row.Value = types.JSONRaw(`"` + expected + `"`)
 		if err := app.Save(row); err != nil {
-			return errors.Wrap(err, "failed to persist master key fingerprint")
+			return fmt.Errorf("failed to persist master key fingerprint: %w", err)
 		}
 		return nil
 	}
 	var stored string
 	if err := json.Unmarshal(param.Value, &stored); err != nil {
-		return errors.Wrap(err, "failed to parse stored master key fingerprint")
+		return fmt.Errorf("failed to parse stored master key fingerprint: %w", err)
 	}
 	if stored == expected {
 		return nil
@@ -213,7 +222,7 @@ func verifyOrWriteFingerprint(app core.App, master []byte, provider MasterKeyPro
 	// the active fingerprint so future readers don't re-trigger this path.
 	keyring, kerr := resolveKeyring(ctx, provider)
 	if kerr != nil {
-		return errors.Wrap(kerr, "failed to resolve keyring for fingerprint check")
+		return fmt.Errorf("failed to resolve keyring for fingerprint check: %w", kerr)
 	}
 	if _, ok := keyring[stored]; !ok {
 		return errors.New("OAUTH2_MASTER_KEY fingerprint mismatch -- refusing to decrypt with wrong key (stored=" + stored + ", env=" + expected + ")")
@@ -270,11 +279,11 @@ func updateParamValueCAS(app core.App, paramID string, raw []byte, expectedValue
 			"expected": string(expectedValue),
 		}).Execute()
 	if err != nil {
-		return false, errors.Wrap(err, "failed to CAS-update _params row")
+		return false, fmt.Errorf("failed to CAS-update _params row: %w", err)
 	}
 	n, err := result.RowsAffected()
 	if err != nil {
-		return false, errors.Wrap(err, "failed to read CAS rows affected")
+		return false, fmt.Errorf("failed to read CAS rows affected: %w", err)
 	}
 	return n > 0, nil
 }
@@ -299,7 +308,7 @@ func loadParamFromAppStorage[T any](app core.App, paramId string, value T, gener
 	ctx := context.Background()
 	master, err := provider.Master(ctx)
 	if err != nil {
-		return zero, errors.Wrap(err, "failed to load master key")
+		return zero, fmt.Errorf("failed to load master key: %w", err)
 	}
 
 	if err := verifyOrWriteFingerprint(app, master, provider, ctx); err != nil {
@@ -321,13 +330,13 @@ func loadParamFromAppStorage[T any](app core.App, paramId string, value T, gener
 	err = app.ModelQuery(param).Model(paramId, param)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			return zero, errors.Wrap(err, "failed to query db")
+			return zero, fmt.Errorf("failed to query db: %w", err)
 		}
 		// No existing value: generate, then store (encrypted if
 		// master is set, plaintext otherwise).
 		newValue, err := generator()
 		if err != nil {
-			return zero, errors.Wrap(err, "failed to generate new value")
+			return zero, fmt.Errorf("failed to generate new value: %w", err)
 		}
 		plaintext, err := encodePlaintext(newValue)
 		if err != nil {
@@ -337,7 +346,7 @@ func loadParamFromAppStorage[T any](app core.App, paramId string, value T, gener
 		if master != nil {
 			stored, err = sealEnvelope(master, ctxID, paramId, plaintext)
 			if err != nil {
-				return zero, errors.Wrap(err, "failed to seal envelope")
+				return zero, fmt.Errorf("failed to seal envelope: %w", err)
 			}
 		}
 		if err := saveParamValue(app, paramId, stored); err != nil {
@@ -350,7 +359,7 @@ func loadParamFromAppStorage[T any](app core.App, paramId string, value T, gener
 			if rErr := app.ModelQuery(recovered).Model(paramId, recovered); rErr == nil {
 				return loadDecodedParam(ctx, provider, master, app.DataDir(), ctxID, paramId, recovered, value)
 			}
-			return zero, errors.Wrap(err, "failed to save value")
+			return zero, fmt.Errorf("failed to save value: %w", err)
 		}
 		return newValue, nil
 	}
@@ -368,7 +377,7 @@ func loadParamFromAppStorage[T any](app core.App, paramId string, value T, gener
 		// we re-seal with (active master, ctxID) on the next CAS.
 		keyring, kerr := resolveKeyring(ctx, provider)
 		if kerr != nil {
-			return zero, errors.Wrap(kerr, "failed to resolve master keyring")
+			return zero, fmt.Errorf("failed to resolve master keyring: %w", kerr)
 		}
 		activeKid := fingerprintOf(master)
 		plaintext, needsRewrap, oerr := openEnvelopeWithKeyring(
@@ -429,7 +438,7 @@ func loadDecodedParam[T any](
 		}
 		keyring, kerr := resolveKeyring(ctx, provider)
 		if kerr != nil {
-			return zero, errors.Wrap(kerr, "failed to resolve master keyring")
+			return zero, fmt.Errorf("failed to resolve master keyring: %w", kerr)
 		}
 		activeKid := fingerprintOf(master)
 		plaintext, _, oerr := openEnvelopeWithKeyring(keyring, activeKid, ctxID, dataDir, paramID, env)

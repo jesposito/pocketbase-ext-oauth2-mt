@@ -2,12 +2,13 @@ package oauth2
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/compose"
 	fositeoauth2 "github.com/ory/fosite/handler/oauth2"
-	"github.com/pkg/errors"
 	"github.com/pocketbase/pocketbase/core"
 )
 
@@ -44,23 +45,43 @@ func (s *PocketBaseStrategy) AccessTokenSignature(ctx context.Context, token str
 func (s *PocketBaseStrategy) GenerateAccessToken(ctx context.Context, requester fosite.Requester) (token string, signature string, err error) {
 	session, ok := requester.GetSession().(*Session)
 	if !ok {
-		return "", "", errors.Errorf("Session must be of type oauth2.Session but got type: %T", requester.GetSession())
+		return "", "", fmt.Errorf("Session must be of type oauth2.Session but got type: %T", requester.GetSession())
 	}
 	user, err := s.App.FindRecordById(session.CollectionId, session.Subject)
 	if err != nil {
-		return "", "", errors.Wrap(err, "Failed to get auth record for session")
+		return "", "", fmt.Errorf("Failed to get auth record for session: %w", err)
 	}
 	token, err = user.NewStaticAuthToken(s.Config.GetAccessTokenLifespan(ctx))
 	if err != nil {
-		return "", "", errors.Wrap(err, "Failed to generate new auth token")
+		return "", "", fmt.Errorf("Failed to generate new auth token: %w", err)
 	}
 	return token, s.AccessTokenSignature(ctx, token), nil
 }
 
 // ValidateAccessToken implements [oauth2.CoreStrategy].
+//
+// Two checks: (1) the PB native JWT must validate (cryptographic + expiry),
+// and (2) the corresponding _oauth2Access session row must still exist.
+// The second check is what makes /oauth2/revoke actually effective for
+// callers that reach this function (fosite introspection + the local
+// RequireScope middleware). PB-native routes that use apis.RequireAuth()
+// bypass this entirely — wire RevokedTokenGuard() on those routes when
+// you need revocation to take effect there too.
 func (s *PocketBaseStrategy) ValidateAccessToken(ctx context.Context, requester fosite.Requester, token string) error {
-	_, err := s.App.FindAuthRecordByToken(token, core.TokenTypeAuth)
-	return err
+	if _, err := s.App.FindAuthRecordByToken(token, core.TokenTypeAuth); err != nil {
+		return err
+	}
+	signature := s.AccessTokenSignature(ctx, token)
+	if signature == "" {
+		return fosite.ErrInvalidTokenFormat
+	}
+	if _, err := findSessionModelBySignature(s.App, &AccessTokenModel{}, signature); err != nil {
+		if errors.Is(err, fosite.ErrNotFound) {
+			return fosite.ErrInactiveToken
+		}
+		return err
+	}
+	return nil
 }
 
 // REFRESH TOKEN
