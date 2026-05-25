@@ -2,8 +2,17 @@ import Alpine from "alpinejs";
 import PocketBase, { type AuthRecord, type AuthMethodsList } from "pocketbase";
 import MultiAuthStore from "./lib/multi-auth-store";
 import toastStore from "./lib/toast-store";
-import { postRedirect, sentenize, base64UrlDecode } from "./lib/utils";
+import {
+    completeInteraction,
+    fetchInteractionState,
+    sentenize,
+} from "./lib/utils";
 import "./login.style.min.css";
+
+// pathPrefix is the OAuth2 plugin's mounted prefix relative to the app
+// origin. The login UI is served at <prefix>/login, so the parent dir
+// of the current URL is the prefix.
+const pathPrefix = window.location.pathname.replace(/\/login\/?$/, "");
 
 //
 
@@ -33,13 +42,14 @@ type LoginState = {
     };
 
     params: {
+        interaction_id: string;
         collection: string;
         client_id: string;
         client_name: string;
-        redirect_uri: string;
-        prompt: "login" | "none" | "consent";
+        prompt: "login" | "none" | "consent" | "";
         max_age?: number;
         requested_scopes: string[];
+        granted_scopes: string[];
     };
 
     error: string;
@@ -122,13 +132,14 @@ Alpine.data<Partial<LoginState>, any>('oauth', () => {
         },
 
         params: {
+            interaction_id: "",
             collection: "",
             client_id: "",
             client_name: "",
-            redirect_uri: "",
-            prompt: "login",
+            prompt: "",
             max_age: 7 * 24 * 60 * 60, // 7 days in seconds
             requested_scopes: [],
+            granted_scopes: [],
         },
 
         error: "",
@@ -140,17 +151,37 @@ Alpine.data<Partial<LoginState>, any>('oauth', () => {
             this.state!.validAccountsForReq = getValidAccountsForReq();
 
             if (this.params.prompt === "none") {
+                // prompt=none: silent attempt. Server enforces consent
+                // policy (mci); the UI just forwards a token if one is
+                // cached and lets the server decide.
                 if (this.state.validAccountsForReq.length === 1) {
-                    // TODO/conformance: Check login_hint if provided. Return "login_required" if it doesn't match.
-                    const { token, iat } = pbAuthStore.selectByRecord(this.state.validAccountsForReq[0])!;
-                    postRedirect(this.params.redirect_uri, { pb_token: token, pb_token_iat: iat });
-                } else if (this.state.validAccountsForReq.length > 1) {
-                    // TODO/conformance: Check login_hint if provided. 
-                    //       - If it matches exactly one account, return that.
-                    //       - If it doesn't match any, return "login_required".
-                    postRedirect(this.params.redirect_uri, { error: "account_selection_required" });
+                    const cached = pbAuthStore.selectByRecord(this.state.validAccountsForReq[0])!;
+                    try {
+                        await completeInteraction(pathPrefix, {
+                            interaction_id: this.params.interaction_id,
+                            pb_token: cached.token,
+                            pb_token_iat: cached.iat,
+                            decision: "approve",
+                            // For silent flows we offer the previously
+                            // granted scopes only; the server will check
+                            // coverage and reject if insufficient.
+                            consented_scopes: this.params.granted_scopes,
+                        });
+                    } catch (err) {
+                        this.handleErr(err);
+                    }
                 } else {
-                    postRedirect(this.params.redirect_uri, { error: "login_required" });
+                    // No cached account (or multiple): server-side flow
+                    // emits the appropriate RP redirect via
+                    // login/complete with decision=deny.
+                    try {
+                        await completeInteraction(pathPrefix, {
+                            interaction_id: this.params.interaction_id,
+                            decision: "deny",
+                        });
+                    } catch (err) {
+                        this.handleErr(err);
+                    }
                 }
                 return;
 
@@ -353,14 +384,18 @@ Alpine.data<Partial<LoginState>, any>('oauth', () => {
             this.handleSuccessfulConsent();
         },
 
-        // declineConsent redirects the RP with RFC 6749 section 4.1.2.1
-        // error=access_denied so the relying party knows the user explicitly
-        // refused (vs an interaction-required scenario or a tab-close).
-        declineConsent() {
-            postRedirect(this.params.redirect_uri, {
-                error: "access_denied",
-                error_description: "User declined consent",
-            });
+        // declineConsent calls /login/complete with decision=deny. The
+        // server returns the RP redirect (RFC 6749 §4.1.2.1
+        // error=access_denied + RFC 9207 iss) and we navigate to it.
+        async declineConsent() {
+            try {
+                await completeInteraction(pathPrefix, {
+                    interaction_id: this.params.interaction_id,
+                    decision: "deny",
+                });
+            } catch (err) {
+                this.handleErr(err);
+            }
         },
 
         // onEscape: pressing Escape on the consent panel declines the grant.
@@ -402,9 +437,23 @@ Alpine.data<Partial<LoginState>, any>('oauth', () => {
 
         //
 
-        handleSuccessfulConsent() {
-            const { token, iat } = pbAuthStore.selected!;
-            postRedirect(this.params.redirect_uri, { pb_token: token, pb_token_iat: iat });
+        async handleSuccessfulConsent() {
+            const sel = pbAuthStore.selected;
+            if (!sel) {
+                this.handleErr(new Error("No selected account; cannot complete consent."));
+                return;
+            }
+            try {
+                await completeInteraction(pathPrefix, {
+                    interaction_id: this.params.interaction_id,
+                    pb_token: sel.token,
+                    pb_token_iat: sel.iat,
+                    decision: "approve",
+                    consented_scopes: this.params.requested_scopes,
+                });
+            } catch (err) {
+                this.handleErr(err);
+            }
         },
 
         //
@@ -423,44 +472,40 @@ Alpine.data<Partial<LoginState>, any>('oauth', () => {
 
     //
 
-    try {
-        const stateURLParam = new URLSearchParams(window.location.search).get("state") || "";
-        const stateJSON = base64UrlDecode(stateURLParam);
-        const stateData = JSON.parse(stateJSON);
-        if (typeof stateData !== "object" || stateData === null) {
-            throw new Error("Unexpected format");
-        }
-
-        const {
-            collection,
-            client_id,
-            redirect_uri,
-            login_hint,
-        } = stateData;
-
-        if (!collection) {
-            throw new Error("Missing collection");
-        }
-        if (!client_id) {
-            throw new Error("Missing client_id");
-        }
-        if (!redirect_uri) {
-            throw new Error("Missing redirect_uri");
-        }
-        if (login_hint) {
-            ret.state!.passwordLoginForm.identity = String(login_hint);
-        }
-
-        ret.params!.collection = String(collection);
-        ret.params!.client_id = String(client_id);
-        ret.params!.client_name = String(stateData.client_name);
-        ret.params!.redirect_uri = String(redirect_uri);
-        ret.params!.prompt = String(stateData.prompt || "consent") as any;
-        ret.params!.max_age = Number(stateData.max_age) || 7 * 24 * 60 * 60;
-        ret.params!.requested_scopes = Array.from(stateData.requested_scopes || []).map(String);
-    } catch (e) {
-        return { error: "Invalid state: " + (e instanceof Error ? e.message : String(e)) }
+    // lr7: the UI no longer trusts (or even reads) a browser-supplied
+    // state JSON blob. The only thing carried in the URL is the opaque
+    // interaction_id. All authoritative metadata (client name, requested
+    // scopes, prompt, user collection, redirect_uri) is fetched from the
+    // server's /oauth2/login/state endpoint and held in memory only.
+    const interactionID = new URLSearchParams(window.location.search).get("interaction_id") || "";
+    if (!interactionID) {
+        return { error: "Missing interaction_id" };
     }
+    ret.params!.interaction_id = interactionID;
+
+    // Block init() until the server-side state has been resolved.
+    const stateLoadPromise = fetchInteractionState(pathPrefix, interactionID)
+        .then((data) => {
+            if (!data || !data.client_id || !data.user_collection) {
+                throw new Error("Interaction state is missing required fields");
+            }
+            ret.params!.collection = data.user_collection;
+            ret.params!.client_id = data.client_id;
+            ret.params!.client_name = data.client_name || "";
+            ret.params!.prompt = (data.prompt || "consent") as any;
+            ret.params!.requested_scopes = (data.requested_scopes || []).map(String);
+            ret.params!.granted_scopes = (data.granted_scopes || []).map(String);
+        })
+        .catch((err) => {
+            ret.error = "Invalid or expired interaction: " + (err instanceof Error ? err.message : String(err));
+        });
+
+    const originalInit = ret.init!.bind(ret);
+    ret.init = async () => {
+        await stateLoadPromise;
+        if (ret.error) return;
+        await originalInit();
+    };
 
     return ret;
 });

@@ -12,6 +12,8 @@ const (
 	PKCECollectionName          = "_oauth2PKCE"
 	OpenIDConnectCollectionName = "_oauth2OpenID"
 	JTICollectionName           = "_oauth2JTI"
+	InteractionCollectionName   = "_oauth2Interactions"
+	ConsentCollectionName       = "_oauth2Consents"
 
 	CleanupExpiredSessionsJobName = "__pbOAuth2Cleanup__"
 )

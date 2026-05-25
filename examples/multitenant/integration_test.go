@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -220,8 +221,11 @@ func (tn *tenant) userPBToken(t *testing.T) string {
 	return tok
 }
 
-// authorizeAndGetCode drives a full /oauth2/auth GET with PKCE + pb_token
-// shortcut and returns the authorization code from the redirect Location.
+// authorizeAndGetCode drives the full server-mediated /oauth2/auth ->
+// /oauth2/login -> /oauth2/login/complete flow and returns the auth code
+// extracted from the final client redirect. The pb_token-in-form shortcut
+// has been removed (lr7); all authentication now goes through the
+// interaction store.
 func (tn *tenant) authorizeAndGetCode(t *testing.T, scope, challenge string) (code, iss string) {
 	t.Helper()
 	form := url.Values{}
@@ -231,27 +235,56 @@ func (tn *tenant) authorizeAndGetCode(t *testing.T, scope, challenge string) (co
 	form.Set("scope", scope)
 	form.Set("code_challenge", challenge)
 	form.Set("code_challenge_method", "S256")
-	form.Set("pb_token", tn.userPBToken(t))
 	form.Set("state", "demo-state-xyz")
 
+	// Step 1: /auth -> /login redirect with interaction_id.
 	req := httptest.NewRequest(http.MethodGet, "/oauth2/auth?"+form.Encode(), nil)
 	rec := httptest.NewRecorder()
 	tn.dispatch(t, rec, req)
-
-	if rec.Code != http.StatusSeeOther && rec.Code != http.StatusFound && rec.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("[%s] authorize expected redirect, got %d: %s", tn.name, rec.Code, rec.Body.String())
+	if rec.Code < 300 || rec.Code >= 400 {
+		t.Fatalf("[%s] /auth expected 3xx, got %d: %s", tn.name, rec.Code, rec.Body.String())
 	}
 	loc, err := url.Parse(rec.Header().Get("Location"))
 	if err != nil {
-		t.Fatalf("[%s] parse Location: %v", tn.name, err)
+		t.Fatalf("[%s] parse /auth Location: %v", tn.name, err)
 	}
-	if errParam := loc.Query().Get("error"); errParam != "" {
-		t.Fatalf("[%s] authorize redirect carries error=%s: %s", tn.name, errParam, loc.Query().Get("error_description"))
+	interactionID := loc.Query().Get("interaction_id")
+	if interactionID == "" {
+		t.Fatalf("[%s] expected interaction_id in /auth redirect, got %s", tn.name, loc.String())
 	}
-	code = loc.Query().Get("code")
-	iss = loc.Query().Get("iss")
+
+	// Step 2: POST /login/complete with pb_token + approve.
+	body, _ := json.Marshal(map[string]any{
+		"interaction_id":   interactionID,
+		"pb_token":         tn.userPBToken(t),
+		"pb_token_iat":     time.Now().Unix(),
+		"decision":         "approve",
+		"consented_scopes": strings.Split(scope, " "),
+	})
+	req = httptest.NewRequest(http.MethodPost, "/oauth2/login/complete", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	tn.dispatch(t, rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("[%s] /login/complete = %d: %s", tn.name, rec.Code, rec.Body.String())
+	}
+	var lcResp struct {
+		RedirectURI string `json:"redirect_uri"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&lcResp); err != nil {
+		t.Fatalf("[%s] decode /login/complete: %v", tn.name, err)
+	}
+	final, err := url.Parse(lcResp.RedirectURI)
+	if err != nil {
+		t.Fatalf("[%s] parse final redirect: %v", tn.name, err)
+	}
+	if errParam := final.Query().Get("error"); errParam != "" {
+		t.Fatalf("[%s] final redirect carries error=%s: %s", tn.name, errParam, final.Query().Get("error_description"))
+	}
+	code = final.Query().Get("code")
+	iss = final.Query().Get("iss")
 	if code == "" {
-		t.Fatalf("[%s] no code in redirect: %s", tn.name, loc.String())
+		t.Fatalf("[%s] no code in final redirect: %s", tn.name, final.String())
 	}
 	return code, iss
 }

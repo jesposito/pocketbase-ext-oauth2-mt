@@ -344,6 +344,7 @@ func Register(app core.App, config *Config) error {
 			consts.PKCECollectionName,
 			consts.OpenIDConnectCollectionName,
 			consts.JTICollectionName,
+			consts.InteractionCollectionName,
 		} {
 			records, err := app.FindAllRecords(
 				collection,
@@ -549,6 +550,15 @@ func bindOAuth2Handlers(inst *Instance, r *router.Router[*core.RequestEvent]) {
 	// prefixes as well.
 	rg.GET("/login", uiHandler)
 	rg.POST("/login", uiHandler)
+
+	// lr7 + mci: server-owned interaction store. /login/state gives the
+	// UI metadata for a pending interaction (no browser-controlled state
+	// blob), /login/complete consumes the pending interaction and runs
+	// the actual fosite authorize handshake using server-stored params.
+	rg.GET("/login/state", func(e *core.RequestEvent) error { return api_OAuth2LoginState(e, inst) })
+	rg.OPTIONS("/login/state", func(e *core.RequestEvent) error { return api_OAuth2LoginState(e, inst) })
+	rg.POST("/login/complete", func(e *core.RequestEvent) error { return api_OAuth2LoginComplete(e, inst) })
+	rg.OPTIONS("/login/complete", func(e *core.RequestEvent) error { return api_OAuth2LoginComplete(e, inst) })
 }
 
 func bindOAuth2WellKnownHandlers(inst *Instance, r *router.Router[*core.RequestEvent]) {
