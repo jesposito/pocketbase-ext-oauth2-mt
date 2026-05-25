@@ -14,7 +14,7 @@ import (
 	"github.com/go-jose/go-jose/v3"
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/compose"
-	"github.com/pkg/errors"
+	"errors"
 
 	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
 	_ "github.com/jesposito/pocketbase-ext-oauth2-mt/migrations"
@@ -456,6 +456,23 @@ func ResetGlobalStateForTests() {}
 // ResetStateForTests removes the OAuth2 instance from the app's store.
 // Use this in tests that need a clean slate.
 func ResetStateForTests(app core.App) {
+	Deregister(app)
+}
+
+// Deregister removes the plugin's per-app state from the given core.App
+// and clears the registrationGuard entry. Use this in long-running
+// processes that create and destroy tenant apps dynamically — otherwise
+// registrationGuard accumulates stale interface-value entries for the
+// lifetime of the process.
+//
+// After Deregister, Register may be called again on the same app value.
+// HTTP handlers and cron jobs already bound to the app remain bound; this
+// only releases the plugin's bookkeeping state. For full teardown, drop
+// the core.App itself.
+func Deregister(app core.App) {
+	if app == nil {
+		return
+	}
 	app.Store().Remove(storeKey)
 	app.Store().Remove(registeringKey)
 	registrationGuard.Delete(app)

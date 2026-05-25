@@ -6,7 +6,7 @@ import (
 	"github.com/jesposito/pocketbase-ext-oauth2-mt/client"
 	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
+	"fmt"
 	"github.com/pocketbase/pocketbase/core"
 )
 
@@ -92,7 +92,7 @@ func NewClientFromRFC7591Metadata(app core.App, md *RFC7591ClientMetadataRequest
 	m.Set("access_token_strategy", "opaque")
 
 	if err := app.Save(m); err != nil {
-		return nil, "", errors.Wrap(err, "failed to save client metadata")
+		return nil, "", fmt.Errorf("failed to save client metadata: %w", err)
 	}
 
 	c, _ := m.ToClient()
@@ -121,7 +121,7 @@ func (m *ClientModel) ToClient() (*client.Client, error) {
 	c.SectorIdentifierURI = m.GetString("sector_identifier_uri")
 	c.JSONWebKeysURI = m.GetString("jwks_uri")
 	if err := m.UnmarshalJSONField("jwks", &c.JSONWebKeys); err != nil {
-		return nil, errors.Wrap(err, "failed to unmarshal jwks")
+		return nil, fmt.Errorf("failed to unmarshal jwks: %w", err)
 	}
 	c.RequestURIs = m.GetStringSlice("request_uris")
 	c.TokenEndpointAuthMethod = m.GetString("token_endpoint_auth_method")
@@ -129,7 +129,7 @@ func (m *ClientModel) ToClient() (*client.Client, error) {
 	c.RequestObjectSigningAlgorithm = m.GetString("request_object_signing_alg")
 	c.UserinfoSignedResponseAlgorithm = m.GetString("userinfo_signed_response_alg")
 	if err := m.UnmarshalJSONField("metadata", &c.Metadata); err != nil {
-		return nil, errors.Wrap(err, "failed to unmarshal metadata")
+		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
 	}
 	c.AccessTokenStrategy = m.GetString("access_token_strategy")
 	return c, nil

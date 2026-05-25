@@ -5,7 +5,7 @@ import (
 	"slices"
 
 	"github.com/ory/fosite"
-	"github.com/pkg/errors"
+	"fmt"
 	"github.com/pocketbase/pocketbase/core"
 )
 
@@ -350,7 +350,7 @@ func api_OAuth2UserInfo(e *core.RequestEvent, inst *Instance) error {
 
 	info, err := inst.cfg.UserInfoClaimStrategy.GetUserInfoClaims(e, grantedScopes)
 	if err != nil {
-		return e.InternalServerError("", errors.Wrap(err, "GetUserInfoClaims"))
+		return e.InternalServerError("", fmt.Errorf("GetUserInfoClaims: %w", err))
 	}
 	return e.JSON(http.StatusOK, info)
 }

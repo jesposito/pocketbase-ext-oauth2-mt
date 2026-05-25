@@ -70,7 +70,9 @@ func RequireScope(app core.App, requiredScopes ...string) *hook.Handler[*core.Re
 			if ierr != nil || ar == nil || tu != fosite.AccessToken {
 				desc := "The access token provided is expired, revoked, malformed, or invalid for other reasons."
 				if ierr != nil {
-					desc = sanitizeHeaderValue(ierr.Error())
+					// %q already escapes embedded quotes + control chars
+					// safely for an RFC 7230 quoted-string parameter value.
+					desc = ierr.Error()
 				} else if ar != nil && tu != fosite.AccessToken {
 					desc = "The presented token is not an access token."
 				}
@@ -111,13 +113,6 @@ func RequireScope(app core.App, requiredScopes ...string) *hook.Handler[*core.Re
 func writeWWWAuthenticate(e *core.RequestEvent, status int, challenge string) {
 	e.Response.Header().Set("WWW-Authenticate", challenge)
 	e.Response.WriteHeader(status)
-}
-
-// sanitizeHeaderValue strips CR/LF and double-quote characters so the value
-// can be safely embedded in a quoted-string header parameter.
-func sanitizeHeaderValue(v string) string {
-	r := strings.NewReplacer("\r", " ", "\n", " ", `"`, "'")
-	return r.Replace(v)
 }
 
 // bearerTokenFromHeader extracts a bearer token from an Authorization header

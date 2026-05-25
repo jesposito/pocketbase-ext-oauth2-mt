@@ -175,14 +175,19 @@ func TestLooksLikeEnvelope_RejectsPlaintext(t *testing.T) {
 }
 
 func TestDecodeMasterKey_AcceptsFormats(t *testing.T) {
-	want := bytes.Repeat([]byte{0x11}, 32)
+	// Use a real CSPRNG sample so the raw-32 path passes the entropy guard.
+	// The repeated-byte pattern previously used here is rejected by design.
+	want := make([]byte, 32)
+	if _, err := rand.Read(want); err != nil {
+		t.Fatal(err)
+	}
 	cases := map[string]string{
-		"raw-32":      string(want),
-		"hex":         hex.EncodeToString(want),
-		"std-base64":  base64.StdEncoding.EncodeToString(want),
-		"raw-base64":  base64.RawStdEncoding.EncodeToString(want),
-		"url-base64":  base64.URLEncoding.EncodeToString(want),
-		"rawurl-b64":  base64.RawURLEncoding.EncodeToString(want),
+		"raw-32":     string(want),
+		"hex":        hex.EncodeToString(want),
+		"std-base64": base64.StdEncoding.EncodeToString(want),
+		"raw-base64": base64.RawStdEncoding.EncodeToString(want),
+		"url-base64": base64.URLEncoding.EncodeToString(want),
+		"rawurl-b64": base64.RawURLEncoding.EncodeToString(want),
 	}
 	for name, enc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -194,6 +199,23 @@ func TestDecodeMasterKey_AcceptsFormats(t *testing.T) {
 				t.Errorf("decoded mismatch")
 			}
 		})
+	}
+}
+
+// TestDecodeMasterKey_RejectsLowEntropyRaw32 locks in the bi2 fix: a
+// 32-character ASCII passphrase MUST be rejected so the at-rest
+// encryption strength isn't gutted by an operator typing a memorable
+// password into the env var.
+func TestDecodeMasterKey_RejectsLowEntropyRaw32(t *testing.T) {
+	cases := []string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",      // all 'a'
+		"MySuperSecretKeyForOAuth2PluginX",       // memorable, 32 chars
+		"password12345678901234567890ABCD",       // dictionary + numbers
+	}
+	for _, s := range cases {
+		if got, err := decodeMasterKey(s); err == nil {
+			t.Errorf("decodeMasterKey(%q) accepted (got %d bytes); want low-entropy rejection", s, len(got))
+		}
 	}
 }
 
