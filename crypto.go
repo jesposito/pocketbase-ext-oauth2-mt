@@ -25,6 +25,12 @@ import (
 // providers, not implemented yet).
 const envEnvelopeMasterKey = "OAUTH2_MASTER_KEY"
 
+// envEnvelopeMasterKeysOld is the environment variable that lists past
+// master keys (comma-separated, same encodings as OAUTH2_MASTER_KEY)
+// retained for decrypt-only use during a rotation. New writes always
+// re-encrypt with OAUTH2_MASTER_KEY (the active master).
+const envEnvelopeMasterKeysOld = "OAUTH2_MASTER_KEY_OLD"
+
 // envelopeVersion is the only currently understood envelope version. Old
 // values may still be read (migration path), but new writes always use v1.
 const envelopeVersion = 1
@@ -54,6 +60,20 @@ type MasterKeyProvider interface {
 	// key (first 8 bytes of its SHA-256). Returns ("", nil) when no
 	// master is configured.
 	Fingerprint(ctx context.Context) (string, error)
+}
+
+// MasterKeyringProvider is an optional extension implemented by providers
+// that retain historical (decrypt-only) master keys during a rotation. The
+// plugin uses Keyring to:
+//   - decrypt envelopes whose embedded kid does not match the active master
+//     fingerprint (i.e. envelopes written before the rotation);
+//   - re-encrypt those envelopes against the active master on the next read
+//     (lazy rewrap).
+//
+// Implementations must include the active master in the returned map. The
+// map is keyed by the per-master fingerprint (as returned by fingerprintOf).
+type MasterKeyringProvider interface {
+	Keyring(ctx context.Context) (map[string][]byte, error)
 }
 
 // envMasterKeyProvider reads the master key from OAUTH2_MASTER_KEY.
@@ -90,6 +110,41 @@ func (p envMasterKeyProvider) Fingerprint(ctx context.Context) (string, error) {
 		return "", nil
 	}
 	return fingerprintOf(master), nil
+}
+
+// Keyring returns the active master plus any historical decrypt-only
+// masters listed in OAUTH2_MASTER_KEY_OLD. Old keys missing or
+// malformed are silently skipped — fingerprint enforcement on the active
+// master still happens via Master/Fingerprint.
+func (p envMasterKeyProvider) Keyring(ctx context.Context) (map[string][]byte, error) {
+	out := map[string][]byte{}
+	active, err := p.Master(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if active != nil {
+		out[fingerprintOf(active)] = active
+	}
+	raw := strings.TrimSpace(os.Getenv(envEnvelopeMasterKeysOld))
+	if raw == "" {
+		return out, nil
+	}
+	for candidate := range strings.SplitSeq(raw, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		k, derr := decodeMasterKey(candidate)
+		if derr != nil {
+			// Don't fail the whole load over a malformed historical
+			// entry — the active master alone is sufficient for new
+			// writes. Log via a sentinel error consumers can detect
+			// if they care.
+			continue
+		}
+		out[fingerprintOf(k)] = k
+	}
+	return out, nil
 }
 
 // decodeMasterKey accepts the master key as a raw 32-byte string, base64 (std
@@ -161,11 +216,19 @@ func looksLikeEnvelope(raw []byte) (*envelope, bool) {
 }
 
 // deriveDEK computes the per-param data-encryption key from the master.
-// The info string binds the DEK to (this plugin, the app's data dir, the
-// param ID), so the same master used by two app instances still yields
-// distinct DEKs per (app, param).
-func deriveDEK(master []byte, dataDir, paramID string) ([]byte, error) {
-	info := []byte(hkdfInfoPrefix + dataDir + "/" + paramID)
+// The info string binds the DEK to (this plugin, a stable per-app context
+// identifier, the param ID), so the same master used by two app instances
+// still yields distinct DEKs per (app, param).
+//
+// ctxID is a stable per-app value (typically the UUID stored in
+// oauth2_envelope_ctx_id). Previously this code passed app.DataDir() in
+// place of ctxID, which silently broke decryption whenever the data
+// directory was moved, renamed, accessed via a different relative path, or
+// swapped onto a symlink. Migration callers may pass a legacy DataDir
+// string to attempt decrypting envelopes sealed before the ctx-id switch;
+// see openEnvelopeWithFallback.
+func deriveDEK(master []byte, ctxID, paramID string) ([]byte, error) {
+	info := []byte(hkdfInfoPrefix + ctxID + "/" + paramID)
 	r := hkdf.New(sha256.New, master, nil, info)
 	dek := make([]byte, 32)
 	if _, err := io.ReadFull(r, dek); err != nil {
@@ -174,10 +237,12 @@ func deriveDEK(master []byte, dataDir, paramID string) ([]byte, error) {
 	return dek, nil
 }
 
-// sealEnvelope encrypts plaintext under the DEK derived from master+info
-// and returns the JSON envelope bytes ready to store in _params.value.
-func sealEnvelope(master []byte, dataDir, paramID string, plaintext []byte) ([]byte, error) {
-	dek, err := deriveDEK(master, dataDir, paramID)
+// sealEnvelope encrypts plaintext under the DEK derived from master+ctxID
+// and returns the JSON envelope bytes ready to store in _params.value. The
+// envelope's Kid field is set to fingerprintOf(master) so a later loader
+// holding a keyring can pick the right master for decryption.
+func sealEnvelope(master []byte, ctxID, paramID string, plaintext []byte) ([]byte, error) {
+	dek, err := deriveDEK(master, ctxID, paramID)
 	if err != nil {
 		return nil, err
 	}
@@ -204,12 +269,11 @@ func sealEnvelope(master []byte, dataDir, paramID string, plaintext []byte) ([]b
 	return json.Marshal(env)
 }
 
-// openEnvelope decrypts a v1 envelope using master+info-derived DEK. It
-// does not enforce kid -- the caller (the fingerprint check) is responsible
-// for refusing wrong-key loads. We still verify the GCM auth tag, so a
-// silently wrong key fails loudly here too.
-func openEnvelope(master []byte, dataDir, paramID string, env *envelope) ([]byte, error) {
-	dek, err := deriveDEK(master, dataDir, paramID)
+// openEnvelope decrypts a v1 envelope using master+ctxID-derived DEK. We
+// still verify the GCM auth tag, so a wrong key (or wrong ctxID) fails
+// loudly here rather than silently producing garbage.
+func openEnvelope(master []byte, ctxID, paramID string, env *envelope) ([]byte, error) {
+	dek, err := deriveDEK(master, ctxID, paramID)
 	if err != nil {
 		return nil, err
 	}
@@ -237,4 +301,54 @@ func openEnvelope(master []byte, dataDir, paramID string, env *envelope) ([]byte
 		return nil, errors.Wrap(err, "envelope decryption failed (wrong key or corrupted data)")
 	}
 	return pt, nil
+}
+
+// openEnvelopeWithKeyring decrypts using whichever master in the keyring
+// matches env.Kid, with a fallback for envelopes whose ctxID was bound to
+// the app's DataDir (the legacy v1 derivation, pre-15o fix). Returns the
+// plaintext plus a needsRewrap flag set when the row should be re-sealed
+// against (activeMaster, ctxID) — either because Kid pointed at a
+// historical master (d9a) or because the legacy DataDir-derived DEK was
+// what worked (15o).
+//
+// keyring must contain at least the active master. ctxID is the per-app
+// stable context (UUID). legacyCtxID is the app's DataDir at call time,
+// used only for the fallback attempt against pre-15o envelopes.
+func openEnvelopeWithKeyring(
+	keyring map[string][]byte,
+	activeKid string,
+	ctxID, legacyCtxID, paramID string,
+	env *envelope,
+) (plaintext []byte, needsRewrap bool, err error) {
+	// First, try the master that this envelope advertises in Kid.
+	if env.Kid != "" {
+		if m, ok := keyring[env.Kid]; ok {
+			if pt, oerr := openEnvelope(m, ctxID, paramID, env); oerr == nil {
+				return pt, env.Kid != activeKid, nil
+			}
+			// Same master, but ctxID may have been bound to DataDir
+			// before the 15o fix. Retry with legacyCtxID.
+			if legacyCtxID != "" && legacyCtxID != ctxID {
+				if pt, oerr := openEnvelope(m, legacyCtxID, paramID, env); oerr == nil {
+					return pt, true, nil
+				}
+			}
+		}
+	}
+
+	// Either Kid was empty (very old envelopes) or the Kid-lookup attempts
+	// all failed. Fall through: brute-force the keyring, trying both the
+	// current ctxID and the legacy one. This is bounded by the keyring
+	// size which is expected to be 1-2 entries in practice.
+	for kid, m := range keyring {
+		if pt, oerr := openEnvelope(m, ctxID, paramID, env); oerr == nil {
+			return pt, kid != activeKid || (env.Kid != "" && env.Kid != activeKid), nil
+		}
+		if legacyCtxID != "" && legacyCtxID != ctxID {
+			if pt, oerr := openEnvelope(m, legacyCtxID, paramID, env); oerr == nil {
+				return pt, true, nil
+			}
+		}
+	}
+	return nil, false, errors.New("envelope decryption failed for every keyring entry (wrong key, wrong context, or corrupted data)")
 }

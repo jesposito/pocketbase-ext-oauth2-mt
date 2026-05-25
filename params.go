@@ -11,13 +11,15 @@ import (
 	"github.com/go-jose/go-jose/v3"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/types"
 )
 
 const (
-	paramsKeyOAuth2RSAKey       = "oauth2_rsa_key"
-	paramsKeyOAuth2GlobalSecret = "oauth2_global_secret"
+	paramsKeyOAuth2RSAKey         = "oauth2_rsa_key"
+	paramsKeyOAuth2GlobalSecret   = "oauth2_global_secret"
+	paramsKeyOAuth2EnvelopeCtxID  = "oauth2_envelope_ctx_id"
 )
 
 // activeMasterKeyProvider returns the provider configured on the registered
@@ -29,6 +31,67 @@ func activeMasterKeyProvider(app core.App) MasterKeyProvider {
 		return inst.cfg.MasterKeyProvider
 	}
 	return DefaultMasterKeyProvider
+}
+
+// resolveKeyring returns the full set of (kid → master) entries for
+// decryption attempts. If the provider implements MasterKeyringProvider it
+// supplies the set; otherwise the keyring is just the active master.
+func resolveKeyring(ctx context.Context, p MasterKeyProvider) (map[string][]byte, error) {
+	if kp, ok := p.(MasterKeyringProvider); ok {
+		return kp.Keyring(ctx)
+	}
+	m, err := p.Master(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if m == nil {
+		return map[string][]byte{}, nil
+	}
+	return map[string][]byte{fingerprintOf(m): m}, nil
+}
+
+// getOrCreateEnvelopeContext returns the stable per-app context identifier
+// used as HKDF info input. The value is a freshly-generated UUID persisted
+// in the _params table on first call; subsequent calls return the stored
+// value. The ID is intentionally divorced from app.DataDir() (the previous
+// HKDF binding) because moving or symlinking the data directory would
+// otherwise make existing envelopes undecryptable.
+func getOrCreateEnvelopeContext(app core.App) (string, error) {
+	param := &core.Param{}
+	err := app.ModelQuery(param).Model(paramsKeyOAuth2EnvelopeCtxID, param)
+	if err == nil {
+		var stored string
+		if uerr := json.Unmarshal(param.Value, &stored); uerr != nil {
+			return "", errors.Wrap(uerr, "failed to parse stored envelope ctx id")
+		}
+		if stored == "" {
+			return "", errors.New("stored envelope ctx id is empty")
+		}
+		return stored, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", errors.Wrap(err, "failed to query envelope ctx id")
+	}
+	// Generate and persist a new UUID.
+	id := uuid.NewString()
+	row := &core.Param{}
+	row.Id = paramsKeyOAuth2EnvelopeCtxID
+	row.Created = types.NowDateTime()
+	row.Updated = row.Created
+	row.Value = types.JSONRaw(`"` + id + `"`)
+	if serr := app.Save(row); serr != nil {
+		// Race: another caller inserted it between our query and save.
+		// Re-read and return the winner's value.
+		again := &core.Param{}
+		if rerr := app.ModelQuery(again).Model(paramsKeyOAuth2EnvelopeCtxID, again); rerr == nil {
+			var stored string
+			if uerr := json.Unmarshal(again.Value, &stored); uerr == nil && stored != "" {
+				return stored, nil
+			}
+		}
+		return "", errors.Wrap(serr, "failed to persist envelope ctx id")
+	}
+	return id, nil
 }
 
 // loadPrivateKeyFromAppStorage loads the private JSON-Web-Key from the app storage or generates
@@ -103,12 +166,16 @@ func decodePlaintext[T any](raw []byte, value T) (T, error) {
 }
 
 // verifyOrWriteFingerprint enforces the master-key consistency check. If a
-// fingerprint row exists, it must match the active master. If it doesn't
-// exist, this is a first-time write and we record the current fingerprint.
-// Returns an error if the env-configured master disagrees with the row that
-// previous runs wrote -- this prevents the "wrong key silently decrypts to
-// garbage" footgun.
-func verifyOrWriteFingerprint(app core.App, master []byte) error {
+// fingerprint row exists, the stored fingerprint must match either the
+// active master OR one of the keyring entries (a decrypt-only master
+// retained across a rotation). On first run we record the active master's
+// fingerprint. The row is lazily refreshed to the active fingerprint after
+// a successful rotation read so subsequent loads stay in sync.
+//
+// Mismatch (no keyring entry matches) returns an error — refusing to load
+// is the safe choice; silently decrypting to garbage corrupts downstream
+// signing keys.
+func verifyOrWriteFingerprint(app core.App, master []byte, provider MasterKeyProvider, ctx context.Context) error {
 	if master == nil {
 		// Plaintext mode -- nothing to verify, and we don't proactively
 		// remove an existing fingerprint row either. Operators who
@@ -138,31 +205,78 @@ func verifyOrWriteFingerprint(app core.App, master []byte) error {
 	if err := json.Unmarshal(param.Value, &stored); err != nil {
 		return errors.Wrap(err, "failed to parse stored master key fingerprint")
 	}
-	if stored != expected {
+	if stored == expected {
+		return nil
+	}
+	// Stored != active. Acceptable iff the stored fingerprint identifies a
+	// keyring master (rotation in progress). Refresh the stored value to
+	// the active fingerprint so future readers don't re-trigger this path.
+	keyring, kerr := resolveKeyring(ctx, provider)
+	if kerr != nil {
+		return errors.Wrap(kerr, "failed to resolve keyring for fingerprint check")
+	}
+	if _, ok := keyring[stored]; !ok {
 		return errors.New("OAUTH2_MASTER_KEY fingerprint mismatch -- refusing to decrypt with wrong key (stored=" + stored + ", env=" + expected + ")")
+	}
+	// Promote the fingerprint to the active master. CAS on the stored
+	// bytes so two racing rotations don't fight.
+	newValue := []byte(`"` + expected + `"`)
+	if _, werr := updateParamValueCAS(app, fingerprintParamID, newValue, []byte(param.Value)); werr != nil {
+		app.Logger().Warn("[Plugin/OAuth2] failed to promote master key fingerprint after rotation",
+			"stored", stored, "active", expected, "err", werr)
 	}
 	return nil
 }
 
-// saveParamValue writes raw bytes into a _params row, creating or updating.
-func saveParamValue(app core.App, paramID string, raw []byte, created bool) error {
+// saveParamValue creates a brand-new _params row. The update path is split
+// off into updateParamValueCAS so callers must explicitly carry the expected
+// row.Updated through the read→compute→write cycle, eliminating the
+// read-then-blind-overwrite race that loses concurrent updates.
+func saveParamValue(app core.App, paramID string, raw []byte) error {
 	row := &core.Param{}
-	if !created {
-		// Update path: re-fetch so we preserve created timestamp and
-		// satisfy PocketBase's "must exist" semantics on update.
-		err := app.ModelQuery(row).Model(paramID, row)
-		if err != nil {
-			return errors.Wrap(err, "failed to reload param for update")
-		}
-		row.Value = types.JSONRaw(raw)
-		row.Updated = types.NowDateTime()
-		return app.Save(row)
-	}
 	row.Id = paramID
 	row.Created = types.NowDateTime()
 	row.Updated = row.Created
 	row.Value = types.JSONRaw(raw)
 	return app.Save(row)
+}
+
+// updateParamValueCAS does a compare-and-swap UPDATE on a _params row. It
+// only writes if the row's `value` column still equals expectedValue — the
+// bytes the caller observed before computing the new payload. Returns
+// (true, nil) on a successful swap, (false, nil) when the CAS lost (a
+// concurrent writer mutated the row first — the caller decides whether to
+// retry or accept the other writer's state), or (_, err) on a database
+// failure.
+//
+// Value-based, not timestamp-based: types.DateTime has millisecond
+// resolution and two writers can land in the same millisecond, in which
+// case a timestamp CAS silently last-writer-wins. Comparing the value bytes
+// the caller actually observed is the precise invariant.
+//
+// Mirrors the markRefreshRotated pattern in storage.go so concurrent
+// migrations or rotations of a single _params row cannot silently overwrite
+// each other.
+func updateParamValueCAS(app core.App, paramID string, raw []byte, expectedValue []byte) (bool, error) {
+	nowDT := types.NowDateTime()
+	result, err := app.DB().NewQuery(
+		"UPDATE {{_params}} " +
+			"SET [[value]] = {:value}, [[updated]] = {:updated} " +
+			"WHERE [[id]] = {:id} AND [[value]] = {:expected}").
+		Bind(dbx.Params{
+			"value":    string(raw),
+			"updated":  nowDT.String(),
+			"id":       paramID,
+			"expected": string(expectedValue),
+		}).Execute()
+	if err != nil {
+		return false, errors.Wrap(err, "failed to CAS-update _params row")
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, errors.Wrap(err, "failed to read CAS rows affected")
+	}
+	return n > 0, nil
 }
 
 // loadParamFromAppStorage is a generic helper that loads a parameter from
@@ -188,8 +302,19 @@ func loadParamFromAppStorage[T any](app core.App, paramId string, value T, gener
 		return zero, errors.Wrap(err, "failed to load master key")
 	}
 
-	if err := verifyOrWriteFingerprint(app, master); err != nil {
+	if err := verifyOrWriteFingerprint(app, master, provider, ctx); err != nil {
 		return zero, err
+	}
+
+	// Per-app encryption context: a stable UUID stored in _params and used
+	// as HKDF info input instead of app.DataDir(). Only needed when
+	// encryption is active.
+	ctxID := ""
+	if master != nil {
+		ctxID, err = getOrCreateEnvelopeContext(app)
+		if err != nil {
+			return zero, err
+		}
 	}
 
 	param := &core.Param{}
@@ -210,12 +335,21 @@ func loadParamFromAppStorage[T any](app core.App, paramId string, value T, gener
 		}
 		stored := plaintext
 		if master != nil {
-			stored, err = sealEnvelope(master, app.DataDir(), paramId, plaintext)
+			stored, err = sealEnvelope(master, ctxID, paramId, plaintext)
 			if err != nil {
 				return zero, errors.Wrap(err, "failed to seal envelope")
 			}
 		}
-		if err := saveParamValue(app, paramId, stored, true); err != nil {
+		if err := saveParamValue(app, paramId, stored); err != nil {
+			// Race: another writer inserted the row between our SELECT
+			// and INSERT. Read the winner's value and return that — both
+			// writers were generating equivalent freshly-random material,
+			// so the loser silently adopting the winner is safe and gives
+			// the loop above idempotent first-write semantics.
+			recovered := &core.Param{}
+			if rErr := app.ModelQuery(recovered).Model(paramId, recovered); rErr == nil {
+				return loadDecodedParam(ctx, provider, master, app.DataDir(), ctxID, paramId, recovered, value)
+			}
 			return zero, errors.Wrap(err, "failed to save value")
 		}
 		return newValue, nil
@@ -228,9 +362,28 @@ func loadParamFromAppStorage[T any](app core.App, paramId string, value T, gener
 		if master == nil {
 			return zero, errors.New("encrypted _params row found but OAUTH2_MASTER_KEY is unset")
 		}
-		plaintext, err := openEnvelope(master, app.DataDir(), paramId, env)
-		if err != nil {
-			return zero, err
+		// Multi-key + legacy-ctxID-aware decrypt. Returns needsRewrap
+		// when the envelope was sealed with a non-active master (d9a) or
+		// with the legacy DataDir-bound HKDF info (15o); in either case
+		// we re-seal with (active master, ctxID) on the next CAS.
+		keyring, kerr := resolveKeyring(ctx, provider)
+		if kerr != nil {
+			return zero, errors.Wrap(kerr, "failed to resolve master keyring")
+		}
+		activeKid := fingerprintOf(master)
+		plaintext, needsRewrap, oerr := openEnvelopeWithKeyring(
+			keyring, activeKid, ctxID, app.DataDir(), paramId, env,
+		)
+		if oerr != nil {
+			return zero, oerr
+		}
+		if needsRewrap {
+			if resealed, sErr := sealEnvelope(master, ctxID, paramId, plaintext); sErr == nil {
+				if _, wErr := updateParamValueCAS(app, paramId, resealed, raw); wErr != nil {
+					app.Logger().Warn("[Plugin/OAuth2] failed to rewrap envelope under active master",
+						"param", paramId, "err", wErr)
+				}
+			}
 		}
 		return decodePlaintext(plaintext, value)
 	}
@@ -241,17 +394,49 @@ func loadParamFromAppStorage[T any](app core.App, paramId string, value T, gener
 		return zero, err
 	}
 	// Migration: if a master is configured, transparently rewrite the
-	// row as an envelope. Failure to migrate is logged but does not
-	// fail the load -- the next call will try again.
+	// row as an envelope. CAS on the observed `raw` value bytes ensures
+	// concurrent writers cannot last-writer-wins each other.
 	if master != nil {
 		plaintext, err := encodePlaintext(decoded)
 		if err == nil {
-			if sealed, sErr := sealEnvelope(master, app.DataDir(), paramId, plaintext); sErr == nil {
-				if wErr := saveParamValue(app, paramId, sealed, false); wErr != nil {
+			if sealed, sErr := sealEnvelope(master, ctxID, paramId, plaintext); sErr == nil {
+				if _, wErr := updateParamValueCAS(app, paramId, sealed, raw); wErr != nil {
 					app.Logger().Warn("[Plugin/OAuth2] failed to migrate plaintext param to envelope", "param", paramId, "err", wErr)
 				}
 			}
 		}
 	}
 	return decoded, nil
+}
+
+// loadDecodedParam decodes a freshly-read _params row into T, applying the
+// envelope-vs-plaintext detection plus the multi-key keyring decrypt path.
+// Extracted so the create-race recovery branch in loadParamFromAppStorage
+// can decode whichever value the winning racer wrote.
+func loadDecodedParam[T any](
+	ctx context.Context,
+	provider MasterKeyProvider,
+	master []byte,
+	dataDir, ctxID, paramID string,
+	param *core.Param,
+	value T,
+) (T, error) {
+	var zero T
+	raw := []byte(param.Value)
+	if env, isEnv := looksLikeEnvelope(raw); isEnv {
+		if master == nil {
+			return zero, errors.New("encrypted _params row found but OAUTH2_MASTER_KEY is unset")
+		}
+		keyring, kerr := resolveKeyring(ctx, provider)
+		if kerr != nil {
+			return zero, errors.Wrap(kerr, "failed to resolve master keyring")
+		}
+		activeKid := fingerprintOf(master)
+		plaintext, _, oerr := openEnvelopeWithKeyring(keyring, activeKid, ctxID, dataDir, paramID, env)
+		if oerr != nil {
+			return zero, oerr
+		}
+		return decodePlaintext(plaintext, value)
+	}
+	return decodePlaintext(raw, value)
 }

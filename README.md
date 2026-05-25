@@ -118,6 +118,27 @@ Access tokens issued by this plugin are **native PocketBase auth tokens**. This 
 
 On first bootstrap the plugin generates an **RSA (RS256)** signing key pair and a **global HMAC secret**, both stored in PocketBase's internal `_params` table. These persist across restarts and are used for signing ID tokens, authorization codes, and refresh tokens respectively. In multi-tenant mode, each tenant gets its own independent key pair.
 
+#### Envelope encryption at rest
+
+If `OAUTH2_MASTER_KEY` is set (raw 32-byte, base64, or hex), all OAuth signing key material in `_params` is sealed with AES-256-GCM, keyed off a per-(param, app) DEK derived via HKDF. Each tenant gets its own stable HKDF context (a UUID persisted at `oauth2_envelope_ctx_id` in `_params`) so moving or renaming the PocketBase data directory does NOT invalidate existing envelopes.
+
+#### Rotating the master key
+
+Set both env vars at the same time during the rotation window:
+
+```sh
+export OAUTH2_MASTER_KEY=<new-active-key>
+export OAUTH2_MASTER_KEY_OLD=<old-key>[,<older-key>...]
+```
+
+On the next load of each `_params` row the plugin:
+
+1. Decrypts using whichever master matches the envelope's `kid` (consulting both the active key and any keys listed in `OAUTH2_MASTER_KEY_OLD`).
+2. Lazily re-encrypts the row under the active key (compare-and-swap on the row value, so concurrent loaders cannot last-writer-wins each other).
+3. Updates the fingerprint sentinel to the active key.
+
+Once every encrypted row has been touched once after the rotation, `OAUTH2_MASTER_KEY_OLD` can be removed. Until then, the old key is still required to read any row that has not yet been rewrapped.
+
 ### Session Storage
 
 OAuth2 session data (authorization codes, access tokens, refresh tokens, PKCE challenges, and OpenID Connect sessions) is stored in dedicated system collections that are automatically created by the plugin's migration. A cron job runs every hour to clean up expired sessions.
