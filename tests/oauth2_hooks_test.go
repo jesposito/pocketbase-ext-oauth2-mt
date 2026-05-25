@@ -61,6 +61,101 @@ func TestIsRegistered(t *testing.T) {
 	}
 }
 
+// TestRegister_MultiplePrefixesOnSameApp verifies that a single core.App
+// can host two OAuth2 OPs at distinct PathPrefixes — the M3 multi-OP-per-
+// tenant capability. Without the (app, prefix) registration guard this
+// second Register would fail with "already registered for this app".
+func TestRegister_MultiplePrefixesOnSameApp(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+
+	// setupTestApp already registered at the default /oauth2 prefix.
+	// Register a second OP at /oauth2/members.
+	err := oauth2.Register(app, &oauth2.Config{
+		BaseConfig:                             oauth2.GetOAuth2Config(app).BaseConfig,
+		PathPrefix:                             "/oauth2/members",
+		UserCollection:                         testUserCollection,
+		EnableRFC7591DynamicClientRegistration: false,
+		EnableRFC9728ProtectedResourceMetadata: true,
+	})
+	if err != nil {
+		t.Fatalf("second Register() at /oauth2/members failed: %v", err)
+	}
+
+	if !oauth2.IsRegistered(app) {
+		t.Error("default prefix lookup should still report registered")
+	}
+	if !oauth2.IsRegisteredAt(app, "/oauth2/members") {
+		t.Error("/oauth2/members lookup should report registered")
+	}
+	if oauth2.IsRegisteredAt(app, "/oauth2/nonexistent") {
+		t.Error("/oauth2/nonexistent should not report registered")
+	}
+
+	defaultCfg := oauth2.GetOAuth2ConfigAt(app, "/oauth2")
+	membersCfg := oauth2.GetOAuth2ConfigAt(app, "/oauth2/members")
+	if defaultCfg.PathPrefix != "/oauth2" {
+		t.Errorf("default config PathPrefix = %q, want /oauth2", defaultCfg.PathPrefix)
+	}
+	if membersCfg.PathPrefix != "/oauth2/members" {
+		t.Errorf("members config PathPrefix = %q, want /oauth2/members", membersCfg.PathPrefix)
+	}
+	if defaultCfg == membersCfg {
+		t.Error("default and members configs should be distinct instances")
+	}
+}
+
+// TestRegister_SameAppSamePrefix_Rejected verifies the dedup contract is
+// preserved for identical (app, prefix) pairs (back-compat with the
+// original sync.Map semantics).
+func TestRegister_SameAppSamePrefix_Rejected(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+
+	err := oauth2.Register(app, &oauth2.Config{
+		BaseConfig:                             oauth2.GetOAuth2Config(app).BaseConfig,
+		PathPrefix:                             "/oauth2", // same as setupTestApp
+		UserCollection:                         testUserCollection,
+		EnableRFC7591DynamicClientRegistration: false,
+		EnableRFC9728ProtectedResourceMetadata: false,
+	})
+	if err == nil {
+		t.Fatal("expected second Register() at the same prefix to fail")
+	}
+}
+
+// TestDeregisterAt_LeavesOtherPrefixIntact: Deregister-by-prefix releases
+// only the named registration; sibling prefixes on the same app keep
+// working.
+func TestDeregisterAt_LeavesOtherPrefixIntact(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+
+	if err := oauth2.Register(app, &oauth2.Config{
+		BaseConfig:                             oauth2.GetOAuth2Config(app).BaseConfig,
+		PathPrefix:                             "/oauth2/members",
+		UserCollection:                         testUserCollection,
+		EnableRFC7591DynamicClientRegistration: false,
+	}); err != nil {
+		t.Fatalf("second Register: %v", err)
+	}
+
+	oauth2.DeregisterAt(app, "/oauth2/members")
+
+	if oauth2.IsRegisteredAt(app, "/oauth2/members") {
+		t.Error("members should be deregistered")
+	}
+	if !oauth2.IsRegistered(app) {
+		t.Error("default prefix should remain registered")
+	}
+
+	// Full Deregister now cleans up the survivor too.
+	oauth2.Deregister(app)
+	if oauth2.IsRegistered(app) {
+		t.Error("Deregister(app) should clear ALL prefixes")
+	}
+}
+
 func TestClientSecretHashing(t *testing.T) {
 	app := setupTestApp(t)
 	defer app.Cleanup()

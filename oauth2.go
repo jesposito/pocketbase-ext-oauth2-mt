@@ -78,12 +78,25 @@ type Config struct {
 	AllowUnauthenticatedDynamicClientRegistration bool
 }
 
+// GetOAuth2Config returns the Config for the OP registered at
+// DefaultPathPrefix on the given app. Use GetOAuth2ConfigAt when the
+// app hosts multiple OPs at different prefixes.
 func GetOAuth2Config(app core.App) *Config {
 	return mustGetInstance(app).cfg
 }
 
+// GetOAuth2ConfigAt is the prefix-aware variant of GetOAuth2Config.
+func GetOAuth2ConfigAt(app core.App, prefix string) *Config {
+	return mustGetInstanceAt(app, prefix).cfg
+}
+
 func GetOAuth2Store(app core.App) *OAuth2Store {
 	return mustGetInstance(app).store
+}
+
+// GetOAuth2StoreAt is the prefix-aware variant of GetOAuth2Store.
+func GetOAuth2StoreAt(app core.App, prefix string) *OAuth2Store {
+	return mustGetInstanceAt(app, prefix).store
 }
 
 func IsRegistered(app core.App) bool {
@@ -91,6 +104,15 @@ func IsRegistered(app core.App) bool {
 		return false
 	}
 	_, ok := getInstance(app)
+	return ok
+}
+
+// IsRegisteredAt reports whether an OP is bound at the given prefix.
+func IsRegisteredAt(app core.App, prefix string) bool {
+	if app == nil {
+		return false
+	}
+	_, ok := getInstanceAt(app, prefix)
 	return ok
 }
 
@@ -177,25 +199,44 @@ func cloneStrings(in []string) []string {
 	return slices.Clone(in)
 }
 
+// guardKey uniquely identifies a (core.App, PathPrefix) registration so
+// the same app can host multiple OPs at distinct path prefixes (e.g.
+// /oauth2/admin and /oauth2/members in the same tenant). sync.Map keys
+// must be comparable; a struct value is.
+type guardKey struct {
+	app    core.App
+	prefix string
+}
+
 func Register(app core.App, config *Config) error {
+	// Pre-normalize the prefix BEFORE the guard claim so the key matches
+	// what Register's later store-key derivation will use.
+	prefix := DefaultPathPrefix
+	if config != nil && strings.TrimSpace(config.PathPrefix) != "" {
+		prefix = strings.TrimSpace(config.PathPrefix)
+	}
+	key := guardKey{app: app, prefix: prefix}
+
 	// Atomic claim — sync.Map.LoadOrStore is race-free, unlike the prior
 	// Get-then-Set on app.Store(). Concurrent Register() calls on the
-	// same app collapse to one winner; losers see loaded == true and
-	// return the duplicate error without binding any hooks.
-	if _, loaded := registrationGuard.LoadOrStore(app, struct{}{}); loaded {
-		return errors.New("[Plugin/OAuth2] already registered for this app")
+	// same (app, prefix) collapse to one winner; losers see loaded ==
+	// true and return the duplicate error without binding any hooks. A
+	// second Register on the SAME app with a DIFFERENT prefix is allowed
+	// — that is the multi-OP-per-app feature.
+	if _, loaded := registrationGuard.LoadOrStore(key, struct{}{}); loaded {
+		return errors.New("[Plugin/OAuth2] already registered for this app at prefix=" + prefix)
 	}
 
 	// Keep the legacy sentinel in app.Store() too; this is observable by
 	// any external code that already inspected it.
-	app.Store().Set(registeringKey, true)
+	app.Store().Set(registeringStoreKey(prefix), true)
 
 	// Clone config so per-app secrets and defaults are isolated.
 	config = cloneConfig(config)
 
 	// Normalize defaults
 	if config.PathPrefix == "" {
-		config.PathPrefix = "/oauth2"
+		config.PathPrefix = DefaultPathPrefix
 	}
 	if config.UserInfoClaimStrategy == nil {
 		config.UserInfoClaimStrategy = &DefaultUserInfoClaimStrategy{}
@@ -214,8 +255,8 @@ func Register(app core.App, config *Config) error {
 		!config.AllowUnauthenticatedDynamicClientRegistration {
 		// Roll back the registrationGuard claim so a corrected config
 		// can re-attempt registration without restarting the process.
-		registrationGuard.Delete(app)
-		app.Store().Remove(registeringKey)
+		registrationGuard.Delete(key)
+		app.Store().Remove(registeringStoreKey(prefix))
 		return errors.New("[Plugin/OAuth2] EnableRFC7591DynamicClientRegistration is on but no Initial Access Tokens are configured and AllowUnauthenticatedDynamicClientRegistration is false — refusing to expose an unauthenticated /register endpoint")
 	}
 
@@ -226,7 +267,10 @@ func Register(app core.App, config *Config) error {
 
 	// Store the instance immediately so public helpers like
 	// RegisterProtectedResourceMetadata work even before bootstrap.
-	app.Store().Set(storeKey, inst)
+	app.Store().Set(instanceStoreKey(prefix), inst)
+	// Track which prefixes have been registered on this app so
+	// Deregister can clean them all up without external bookkeeping.
+	rememberRegisteredPrefix(app, prefix)
 
 	// Attach bootstrap handler
 	loadParams := func(app core.App) (err error) {
@@ -499,23 +543,70 @@ func ResetStateForTests(app core.App) {
 	Deregister(app)
 }
 
-// Deregister removes the plugin's per-app state from the given core.App
-// and clears the registrationGuard entry. Use this in long-running
-// processes that create and destroy tenant apps dynamically — otherwise
-// registrationGuard accumulates stale interface-value entries for the
-// lifetime of the process.
+// registeredPrefixes tracks which PathPrefixes have been Register()'d on
+// each *core.App. Used by Deregister() to find and clean up every prefix
+// on an app without callers having to remember which ones they used.
+//
+// Key: core.App. Value: *sync.Map of string→struct{}{} prefixes (a set).
+var registeredPrefixes sync.Map
+
+func rememberRegisteredPrefix(app core.App, prefix string) {
+	set, _ := registeredPrefixes.LoadOrStore(app, &sync.Map{})
+	set.(*sync.Map).Store(prefix, struct{}{})
+}
+
+func forgetRegisteredPrefix(app core.App, prefix string) {
+	if v, ok := registeredPrefixes.Load(app); ok {
+		v.(*sync.Map).Delete(prefix)
+	}
+}
+
+func listRegisteredPrefixes(app core.App) []string {
+	v, ok := registeredPrefixes.Load(app)
+	if !ok {
+		return nil
+	}
+	var out []string
+	v.(*sync.Map).Range(func(k, _ any) bool {
+		out = append(out, k.(string))
+		return true
+	})
+	return out
+}
+
+// Deregister removes ALL of the plugin's per-app state from the given
+// core.App and clears the registrationGuard entries for every prefix the
+// app was registered at. Use this in long-running processes that create
+// and destroy tenant apps dynamically — otherwise registrationGuard
+// accumulates stale interface-value entries for the lifetime of the
+// process.
 //
 // After Deregister, Register may be called again on the same app value.
 // HTTP handlers and cron jobs already bound to the app remain bound; this
 // only releases the plugin's bookkeeping state. For full teardown, drop
-// the core.App itself.
+// the core.App itself. Use DeregisterAt to release a single prefix.
 func Deregister(app core.App) {
 	if app == nil {
 		return
 	}
-	app.Store().Remove(storeKey)
-	app.Store().Remove(registeringKey)
-	registrationGuard.Delete(app)
+	for _, prefix := range listRegisteredPrefixes(app) {
+		DeregisterAt(app, prefix)
+	}
+	registeredPrefixes.Delete(app)
+}
+
+// DeregisterAt is the prefix-aware variant of Deregister. It releases
+// just the (app, prefix) registration so other prefixes on the same app
+// remain operational.
+func DeregisterAt(app core.App, prefix string) {
+	if app == nil {
+		return
+	}
+	prefix = normalizePrefix(prefix)
+	app.Store().Remove(instanceStoreKey(prefix))
+	app.Store().Remove(registeringStoreKey(prefix))
+	registrationGuard.Delete(guardKey{app: app, prefix: prefix})
+	forgetRegisteredPrefix(app, prefix)
 }
 
 //

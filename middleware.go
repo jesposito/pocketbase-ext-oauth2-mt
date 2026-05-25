@@ -40,6 +40,13 @@ const ScopeContextKey = "oauth_granted_scopes"
 //	se.Router.GET("/api/widgets", listWidgetsHandler).
 //	    Bind(oauth2.RequireScope(app, "widgets:read"))
 func RequireScope(app core.App, requiredScopes ...string) *hook.Handler[*core.RequestEvent] {
+	return RequireScopeAt(app, DefaultPathPrefix, requiredScopes...)
+}
+
+// RequireScopeAt is the prefix-aware variant of RequireScope. Use it on
+// resource routes that should be gated by an OP registered at a non-
+// default path prefix (e.g. /oauth2/members).
+func RequireScopeAt(app core.App, prefix string, requiredScopes ...string) *hook.Handler[*core.RequestEvent] {
 	return &hook.Handler[*core.RequestEvent]{
 		Func: func(e *core.RequestEvent) error {
 			token := bearerTokenFromHeader(e.Request.Header.Get("Authorization"))
@@ -49,7 +56,7 @@ func RequireScope(app core.App, requiredScopes ...string) *hook.Handler[*core.Re
 				return nil
 			}
 
-			inst, ok := getInstance(app)
+			inst, ok := getInstanceAt(app, prefix)
 			if !ok || inst == nil {
 				// Plugin not registered - cannot validate scopes. Treat as
 				// invalid_token so callers don't accidentally pass-through.

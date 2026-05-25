@@ -81,6 +81,37 @@ oauth2.MustRegister(app2, &oauth2.Config{...})
 
 Each app has its own signing keys, client registry, and session store.
 
+### Multiple OPs on the same app
+
+A single `core.App` can host more than one OAuth2 provider by calling `Register()` with distinct `PathPrefix` values. This is useful when a tenant needs separate OPs for different audiences (e.g. admin tooling vs end-customer logins) that authenticate against different PocketBase auth collections:
+
+```go
+// Admin OP — authenticates against the `users` collection.
+oauth2.MustRegister(app, &oauth2.Config{
+    BaseConfig:     baseCfg,
+    PathPrefix:     "/oauth2/admin",
+    UserCollection: "users",
+})
+
+// Members OP — same app, different prefix, different user collection.
+oauth2.MustRegister(app, &oauth2.Config{
+    BaseConfig:     baseCfg,
+    PathPrefix:     "/oauth2/members",
+    UserCollection: "members",
+})
+```
+
+Each prefix gets its own `Instance` (config, fosite provider, RSA key reference), but the underlying session collections (`_oauth2Clients`, `_oauth2Access`, …) are shared across prefixes on the same app. Lookup helpers have prefix-aware variants:
+
+- `GetOAuth2ConfigAt(app, prefix)`
+- `GetOAuth2StoreAt(app, prefix)`
+- `IsRegisteredAt(app, prefix)`
+- `RegisterProtectedResourceMetadataAt(app, prefix, md)`
+- `RequireScopeAt(app, prefix, scopes...)`
+- `DeregisterAt(app, prefix)`
+
+The zero-suffix versions (`GetOAuth2Config(app)`, `RequireScope(app, …)`, etc.) remain unchanged and continue to resolve the OP at the default `/oauth2` prefix, so existing single-OP integrations keep working.
+
 ---
 
 ## Endpoints
