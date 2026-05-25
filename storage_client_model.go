@@ -66,7 +66,12 @@ func NewClientFromRFC7591Metadata(app core.App, md *RFC7591ClientMetadataRequest
 	m.Set("grant_types", md.GrantTypes)
 	m.Set("response_types", md.ResponseTypes)
 	m.Set("scope", md.Scope)
-	m.Set("audience", []string{})
+	// Default audience for RFC 8707-style resource indicators: the AS's
+	// own issuer URL. RPs that want a tighter audience MUST set it
+	// explicitly when calling RegisterClient. Empty audience used to
+	// mean "any audience accepted" downstream, which is wrong - this
+	// gives audience validation a real value to check against.
+	m.Set("audience", []string{app.Settings().Meta.AppURL})
 	m.Set("owner", "")
 	m.Set("policy_uri", md.PolicyURI)
 	m.Set("tos_uri", md.TermsOfServiceURI)

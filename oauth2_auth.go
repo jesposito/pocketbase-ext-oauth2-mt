@@ -116,6 +116,14 @@ func api_OAuth2Authorize(e *core.RequestEvent, inst *Instance) error {
 	for _, scope := range ar.GetRequestedScopes() {
 		ar.GrantScope(scope)
 	}
+	// Grant the requested audiences as well. Without this, the session
+	// persists granted_audience as empty, and any downstream audience
+	// validation (RFC 8707, resource indicators) sees no granted scope.
+	// fosite has already validated that requested audiences are allowed
+	// for this client via its AudienceMatchingStrategy.
+	for _, aud := range ar.GetRequestedAudience() {
+		ar.GrantAudience(aud)
+	}
 
 	// Now that the user is authorized, we set up a session:
 	mySessionData := NewSession(e.App, u.Id, u.Collection().Id)
@@ -156,6 +164,12 @@ func api_OAuth2Authorize(e *core.RequestEvent, inst *Instance) error {
 		inst.provider.WriteAuthorizeError(ctx, w, ar, err)
 		return nil
 	}
+
+	// RFC 9207 — Authorization Response Issuer Identification. Include
+	// "iss" in every authorization response so clients can detect
+	// mix-up attacks. Advertised via
+	// authorization_response_iss_parameter_supported in discovery.
+	response.AddParameter("iss", e.App.Settings().Meta.AppURL)
 
 	// Last but not least, send the response!
 	inst.provider.WriteAuthorizeResponse(ctx, w, ar, response)

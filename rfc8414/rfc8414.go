@@ -201,4 +201,11 @@ type AuthorizationServerMetadata struct {
 	// [IANA.OAuth.Parameters].  If omitted, the authorization server
 	// does not support PKCE.
 	CodeChallengeMethodsSupported []string `json:"code_challenge_methods_supported,omitempty"`
+
+	// Authorization Response Issuer Parameter Supported (RFC 9207)
+	// OPTIONAL. Boolean parameter indicating whether the authorization
+	// server provides the "iss" parameter in the authorization response
+	// as defined in [RFC9207]. If omitted, the default value is false.
+	// See https://datatracker.ietf.org/doc/html/rfc9207
+	AuthorizationResponseIssParameterSupported bool `json:"authorization_response_iss_parameter_supported,omitempty"`
 }

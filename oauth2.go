@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -69,17 +70,79 @@ func MustRegister(app core.App, config *Config) {
 	}
 }
 
-// cloneConfig creates a deep copy of the provided Config so that per-app
-// mutations (defaults, secrets) do not leak across registrations.
+// cloneConfig produces a per-app copy of Config so per-tenant state never
+// leaks across Register() calls.
+//
+// What gets deep-copied: the embedded fosite.Config struct, plus the
+// slice-typed fields where fosite (or the plugin) writes per-app state —
+// GlobalSecret, RotatedGlobalSecrets, AllowedPromptValues,
+// RefreshTokenScopes, SanitationWhiteList, and the handler-registry
+// slices that fosite mutates when a getter populates defaults.
+//
+// What stays shared (by design): function and interface fields
+// (ScopeStrategy, AudienceMatchingStrategy, JWKSFetcherStrategy,
+// ClientAuthenticationStrategy, ResponseModeHandlerExtension,
+// MessageCatalog, ClientSecretsHasher, HTTPClient, FormPostHTMLTemplate,
+// RedirectSecureChecker, HMACHasher). These are expected to be stateless
+// (or owned by the caller). After Register() the plugin treats them as
+// read-only — callers MUST NOT mutate any field of a Config passed to
+// Register() after the call returns.
 func cloneConfig(src *Config) *Config {
-	// Shallow copy the struct
+	// Shallow copy the outer Config struct.
 	cfg := *src
-	// Deep copy the embedded BaseConfig (fosite.Config)
+
+	// Deep copy the embedded fosite.Config.
 	if src.BaseConfig != nil {
 		base := *src.BaseConfig
+
+		// Byte/string slices — fosite reads these in hot paths and the
+		// plugin overwrites GlobalSecret during loadParams. Aliasing
+		// would let one tenant's secret leak into another.
+		base.GlobalSecret = cloneBytes(src.BaseConfig.GlobalSecret)
+		base.RotatedGlobalSecrets = cloneByteSlices(src.BaseConfig.RotatedGlobalSecrets)
+		base.AllowedPromptValues = cloneStrings(src.BaseConfig.AllowedPromptValues)
+		base.RefreshTokenScopes = cloneStrings(src.BaseConfig.RefreshTokenScopes)
+		base.SanitationWhiteList = cloneStrings(src.BaseConfig.SanitationWhiteList)
+
+		// Handler registries — fosite's GetXEndpointHandlers append
+		// default handlers to the receiver-config slice on first call,
+		// which would otherwise be observable across tenants.
+		base.AuthorizeEndpointHandlers = slices.Clone(src.BaseConfig.AuthorizeEndpointHandlers)
+		base.TokenEndpointHandlers = slices.Clone(src.BaseConfig.TokenEndpointHandlers)
+		base.TokenIntrospectionHandlers = slices.Clone(src.BaseConfig.TokenIntrospectionHandlers)
+		base.RevocationHandlers = slices.Clone(src.BaseConfig.RevocationHandlers)
+		base.PushedAuthorizeEndpointHandlers = slices.Clone(src.BaseConfig.PushedAuthorizeEndpointHandlers)
+
 		cfg.BaseConfig = &base
 	}
 	return &cfg
+}
+
+func cloneBytes(in []byte) []byte {
+	if in == nil {
+		return nil
+	}
+	out := make([]byte, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneByteSlices(in [][]byte) [][]byte {
+	if in == nil {
+		return nil
+	}
+	out := make([][]byte, len(in))
+	for i, v := range in {
+		out[i] = cloneBytes(v)
+	}
+	return out
+}
+
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	return slices.Clone(in)
 }
 
 func Register(app core.App, config *Config) error {
@@ -303,6 +366,9 @@ func buildProviderMetadata(app core.App, cfg *Config) *openid.OpenIDProviderMeta
 			CodeChallengeMethodsSupported: []string{
 				"S256",
 			},
+			// RFC 9207: api_OAuth2Authorize adds "iss" to every
+			// authorization response so RPs can detect mix-up attacks.
+			AuthorizationResponseIssParameterSupported: true,
 		},
 		UserInfoEndpoint: app.Settings().Meta.AppURL + cfg.PathPrefix + "/userinfo",
 		AcrValuesSupported: []string{
