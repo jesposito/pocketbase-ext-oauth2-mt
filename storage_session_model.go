@@ -189,6 +189,61 @@ func (p *RefreshTokenModel) GetCollectionName() string {
 	return consts.RefreshCollectionName
 }
 
+// Refresh-family / reuse-detection fields. See migration
+// 1770365000_refresh_family.go for the schema and storage.go for the
+// state machine that drives these columns.
+
+// RefreshStatus values for the RefreshTokenModel.status column.
+const (
+	RefreshStatusActive  = "active"
+	RefreshStatusRotated = "rotated"
+	RefreshStatusRevoked = "revoked"
+	RefreshStatusReused  = "reused"
+)
+
+func (m *RefreshTokenModel) GetFamilyID() string {
+	return m.GetString("family_id")
+}
+
+func (m *RefreshTokenModel) SetFamilyID(v string) {
+	m.Set("family_id", v)
+}
+
+func (m *RefreshTokenModel) GetParentRefreshID() string {
+	return m.GetString("parent_refresh_id")
+}
+
+func (m *RefreshTokenModel) SetParentRefreshID(v string) {
+	m.Set("parent_refresh_id", v)
+}
+
+func (m *RefreshTokenModel) GetStatus() string {
+	if v := m.GetString("status"); v != "" {
+		return v
+	}
+	return RefreshStatusActive
+}
+
+func (m *RefreshTokenModel) SetStatus(v string) {
+	m.Set("status", v)
+}
+
+func (m *RefreshTokenModel) GetRotatedAt() int64 {
+	return int64(m.GetInt("rotated_at"))
+}
+
+func (m *RefreshTokenModel) SetRotatedAt(ts int64) {
+	m.Set("rotated_at", ts)
+}
+
+func (m *RefreshTokenModel) GetReusedAt() int64 {
+	return int64(m.GetInt("reused_at"))
+}
+
+func (m *RefreshTokenModel) SetReusedAt(ts int64) {
+	m.Set("reused_at", ts)
+}
+
 // PKCE
 
 type PKCEModel struct {
