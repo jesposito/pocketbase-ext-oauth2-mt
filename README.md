@@ -118,6 +118,27 @@ Access tokens issued by this plugin are **native PocketBase auth tokens**. This 
 
 On first bootstrap the plugin generates an **RSA (RS256)** signing key pair and a **global HMAC secret**, both stored in PocketBase's internal `_params` table. These persist across restarts and are used for signing ID tokens, authorization codes, and refresh tokens respectively. In multi-tenant mode, each tenant gets its own independent key pair.
 
+#### Envelope encryption at rest
+
+If `OAUTH2_MASTER_KEY` is set (raw 32-byte, base64, or hex), all OAuth signing key material in `_params` is sealed with AES-256-GCM, keyed off a per-(param, app) DEK derived via HKDF. Each tenant gets its own stable HKDF context (a UUID persisted at `oauth2_envelope_ctx_id` in `_params`) so moving or renaming the PocketBase data directory does NOT invalidate existing envelopes.
+
+#### Rotating the master key
+
+Set both env vars at the same time during the rotation window:
+
+```sh
+export OAUTH2_MASTER_KEY=<new-active-key>
+export OAUTH2_MASTER_KEY_OLD=<old-key>[,<older-key>...]
+```
+
+On the next load of each `_params` row the plugin:
+
+1. Decrypts using whichever master matches the envelope's `kid` (consulting both the active key and any keys listed in `OAUTH2_MASTER_KEY_OLD`).
+2. Lazily re-encrypts the row under the active key (compare-and-swap on the row value, so concurrent loaders cannot last-writer-wins each other).
+3. Updates the fingerprint sentinel to the active key.
+
+Once every encrypted row has been touched once after the rotation, `OAUTH2_MASTER_KEY_OLD` can be removed. Until then, the old key is still required to read any row that has not yet been rewrapped.
+
 ### Session Storage
 
 OAuth2 session data (authorization codes, access tokens, refresh tokens, PKCE challenges, and OpenID Connect sessions) is stored in dedicated system collections that are automatically created by the plugin's migration. A cron job runs every hour to clean up expired sessions.
@@ -175,6 +196,30 @@ oauth2.RegisterProtectedResourceMetadata(app,
 ```
 
 The metadata will be available at `/.well-known/oauth-protected-resource/data`.
+
+---
+
+## Scope & Roadmap
+
+### What is in scope
+
+- **OAuth 2.1** authorization code flow with PKCE (PKCE required by default)
+- **OpenID Connect** Core 1.0 (authorization code flow + ID tokens, RS256)
+- **Discovery** via RFC 8414 (OAuth Authorization Server Metadata) and OpenID Connect Discovery 1.0
+- **Dynamic Client Registration** (RFC 7591, optional)
+- **Protected Resource Metadata** (RFC 9728, optional)
+- **Token revocation** (RFC 7009) and **introspection** (RFC 7662)
+- **RFC 9207** Authorization Response Issuer Identification (`iss` on success and error redirects)
+- **Refresh-token rotation with reuse detection** (refresh-token family tracking)
+- **Envelope encryption at rest** (AES-256-GCM) for OAuth signing key material in `_params`, keyed off `OAUTH2_MASTER_KEY`
+
+### What is deliberately out of scope (v1)
+
+- **Pushed Authorization Requests (PAR, RFC 9126)** — not required by OAuth 2.1 baseline. PAR is a FAPI / high-assurance profile feature. Adding PAR would require a fosite PAR factory, a `/oauth2/par` endpoint, PARStorage, and `pushed_authorization_request_endpoint` discovery metadata. Revisit if FAPI conformance becomes a goal.
+- **DPoP sender-constrained tokens (RFC 9449)** — out of scope for the same reason. DPoP is a FAPI / mobile-app-protected-resource feature. Revisit if FAPI conformance becomes a goal.
+- **mTLS-bound tokens (RFC 8705)** — same reasoning.
+
+These decisions are recorded here so reviewers don't re-raise them. The plugin tracks OAuth 2.1 baseline + commonly-deployed extensions; FAPI work is a separate epic.
 
 ---
 

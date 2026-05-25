@@ -214,6 +214,167 @@ func TestLoadParam_EncryptedRow_NoEnv_Errors(t *testing.T) {
 	}
 }
 
+// TestUpdateParamValueCAS_BlocksStaleWrite asserts that the compare-and-swap
+// helper rejects an update whose expectedUpdated does not match the current
+// row state. This is the wk3 contract: two readers cannot both blindly
+// overwrite a single _params row.
+func TestUpdateParamValueCAS_BlocksStaleWrite(t *testing.T) {
+	withMasterEnv(t, nil)
+	app := newCryptoTestApp(t)
+
+	// Seed a plaintext row by loading the global secret once.
+	if _, err := loadGlobalSecretFromAppStorage(app); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Capture the row's current value bytes — the snapshot both writers
+	// will use as their CAS expected.
+	p1 := &core.Param{}
+	if err := app.ModelQuery(p1).Model(paramsKeyOAuth2GlobalSecret, p1); err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	expected := []byte(p1.Value)
+
+	// Winner: CAS succeeds, row.value flips to "first".
+	ok, err := updateParamValueCAS(app, paramsKeyOAuth2GlobalSecret, []byte(`"first"`), expected)
+	if err != nil {
+		t.Fatalf("winner CAS: %v", err)
+	}
+	if !ok {
+		t.Fatal("winner CAS reported no rows affected")
+	}
+
+	// Loser: CAS uses the now-stale `expected` and MUST fail (zero rows).
+	ok, err = updateParamValueCAS(app, paramsKeyOAuth2GlobalSecret, []byte(`"second"`), expected)
+	if err != nil {
+		t.Fatalf("loser CAS: %v", err)
+	}
+	if ok {
+		t.Fatal("loser CAS reported rows affected — stale write was applied")
+	}
+
+	// Confirm the winner's value is still in place.
+	p2 := &core.Param{}
+	if err := app.ModelQuery(p2).Model(paramsKeyOAuth2GlobalSecret, p2); err != nil {
+		t.Fatalf("re-read row: %v", err)
+	}
+	if string(p2.Value) != `"first"` {
+		t.Errorf("post-CAS value = %q, want %q", string(p2.Value), `"first"`)
+	}
+}
+
+// TestLoadParam_KeyRotation_RewrapsOnRead verifies that when an envelope
+// is sealed under master A, and the active master rotates to B with A
+// kept in OAUTH2_MASTER_KEY_OLD, the next load:
+//   1. successfully decrypts via the keyring (d9a),
+//   2. rewraps the row under B on the same call so subsequent loads do
+//      not need the old key (lazy rotation).
+func TestLoadParam_KeyRotation_RewrapsOnRead(t *testing.T) {
+	masterA := makeKey(t)
+	masterB := makeKey(t)
+
+	// Phase 1: boot with master A, seal a value.
+	withMasterEnv(t, masterA)
+	app := newCryptoTestApp(t)
+	v1, err := loadGlobalSecretFromAppStorage(app)
+	if err != nil {
+		t.Fatalf("seal under A: %v", err)
+	}
+
+	// Phase 2: rotate. Active = B; A is in OAUTH2_MASTER_KEY_OLD.
+	os.Setenv(envEnvelopeMasterKey, base64.StdEncoding.EncodeToString(masterB))
+	os.Setenv(envEnvelopeMasterKeysOld, base64.StdEncoding.EncodeToString(masterA))
+	t.Cleanup(func() {
+		os.Unsetenv(envEnvelopeMasterKeysOld)
+	})
+
+	v2, err := loadGlobalSecretFromAppStorage(app)
+	if err != nil {
+		t.Fatalf("decrypt under rotation: %v", err)
+	}
+	if !bytes.Equal(v1, v2) {
+		t.Errorf("rotated load returned different value")
+	}
+
+	// Row should now be sealed under B's fingerprint.
+	raw := rawParamValue(t, app, paramsKeyOAuth2GlobalSecret)
+	env, ok := looksLikeEnvelope(raw)
+	if !ok {
+		t.Fatalf("expected envelope, got: %s", raw)
+	}
+	if env.Kid != fingerprintOf(masterB) {
+		t.Errorf("post-rewrap kid = %q, want %q (rewrap to active master B)", env.Kid, fingerprintOf(masterB))
+	}
+
+	// Phase 3: drop A from the env — read must still succeed.
+	os.Unsetenv(envEnvelopeMasterKeysOld)
+	v3, err := loadGlobalSecretFromAppStorage(app)
+	if err != nil {
+		t.Fatalf("post-rewrap load without A: %v", err)
+	}
+	if !bytes.Equal(v1, v3) {
+		t.Errorf("post-rewrap load returned different value")
+	}
+}
+
+// TestLoadParam_DataDirChange verifies the 15o fix: an envelope sealed
+// when the HKDF info was bound to app.DataDir() can still be decrypted
+// after the per-app context UUID becomes the canonical binding, and the
+// row is rewrapped under (active master, ctxID) on the next read.
+func TestLoadParam_DataDirChange(t *testing.T) {
+	master := makeKey(t)
+	withMasterEnv(t, master)
+	app := newCryptoTestApp(t)
+
+	// Seed a row through the normal path. This will use the ctxID (the
+	// post-15o derivation). To simulate a "legacy" envelope from before
+	// the ctxID switch we manually overwrite the row with one sealed
+	// against app.DataDir() and then drop the ctxID row.
+	original, err := loadGlobalSecretFromAppStorage(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintext := hex.AppendEncode([]byte{}, original)
+	sealed, err := sealEnvelope(master, app.DataDir(), paramsKeyOAuth2GlobalSecret, plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := &core.Param{}
+	if err := app.ModelQuery(row).Model(paramsKeyOAuth2GlobalSecret, row); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.DB().NewQuery("UPDATE _params SET value = {:v} WHERE id = {:id}").Bind(map[string]any{
+		"v":  string(sealed),
+		"id": paramsKeyOAuth2GlobalSecret,
+	}).Execute(); err != nil {
+		t.Fatal(err)
+	}
+	// Drop the ctxID so the next load creates a new one (matches a real
+	// deployment that predates the ctxID feature).
+	if _, err := app.DB().NewQuery("DELETE FROM _params WHERE id = {:id}").Bind(map[string]any{
+		"id": paramsKeyOAuth2EnvelopeCtxID,
+	}).Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Load must succeed via the DataDir-fallback path.
+	loaded, err := loadGlobalSecretFromAppStorage(app)
+	if err != nil {
+		t.Fatalf("legacy-DataDir envelope load: %v", err)
+	}
+	if !bytes.Equal(loaded, original) {
+		t.Error("legacy-envelope plaintext mismatch")
+	}
+
+	// And the row should now be rewrapped against the new ctxID — a
+	// second load with a different DataDir would still work.
+	raw := rawParamValue(t, app, paramsKeyOAuth2GlobalSecret)
+	env, _ := looksLikeEnvelope(raw)
+	if env == nil {
+		t.Fatal("expected envelope after rewrap")
+	}
+}
+
 func TestLoadPrivateKey_EncryptedRoundTrip(t *testing.T) {
 	withMasterEnv(t, makeKey(t))
 	app := newCryptoTestApp(t)

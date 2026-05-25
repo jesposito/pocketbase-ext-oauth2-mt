@@ -3,6 +3,7 @@ package oauth2
 import (
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -137,6 +138,59 @@ func TestRequireScope_InsufficientScope_Returns403(t *testing.T) {
 	}
 }
 
+func TestRequireScope_QueryStringToken_Rejected(t *testing.T) {
+	// Header-only by design: a token presented via ?access_token=... must NOT
+	// be accepted, even when a valid access-token row exists. This guards
+	// against URL-query token leakage (RFC 6750 §5.3).
+	app := setupTestApp(t)
+	defer app.Cleanup()
+	seedTestUser(t, app)
+	seedTestClient(t, app)
+
+	bearer := mintBearerForUser(t, app)
+	seedAccessTokenRow(t, app, bearer, "widgets:read")
+
+	mw := oauth2.RequireScope(app, "widgets:read")
+	req := httptest.NewRequest(http.MethodGet, "/test/protected?access_token="+bearer, nil)
+	rec := httptest.NewRecorder()
+	e := &core.RequestEvent{App: app}
+	e.Request = req
+	e.Response = rec
+
+	if err := mw.Func(e); err != nil {
+		t.Fatalf("middleware returned err: %v", err)
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for query-string token, got %d", rec.Code)
+	}
+}
+
+func TestRequireScope_FormBodyToken_Rejected(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+	seedTestUser(t, app)
+	seedTestClient(t, app)
+
+	bearer := mintBearerForUser(t, app)
+	seedAccessTokenRow(t, app, bearer, "widgets:read")
+
+	mw := oauth2.RequireScope(app, "widgets:read")
+	body := "access_token=" + bearer
+	req := httptest.NewRequest(http.MethodPost, "/test/protected", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	e := &core.RequestEvent{App: app}
+	e.Request = req
+	e.Response = rec
+
+	if err := mw.Func(e); err != nil {
+		t.Fatalf("middleware returned err: %v", err)
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for form-body token, got %d", rec.Code)
+	}
+}
+
 func TestRequireScope_AllScopesGranted_PassesThrough(t *testing.T) {
 	app := setupTestApp(t)
 	defer app.Cleanup()
@@ -169,14 +223,7 @@ func TestRequireScope_AllScopesGranted_PassesThrough(t *testing.T) {
 		t.Fatalf("downstream handler did not see granted scopes in context")
 	}
 	// Sanity check: required scope must be present in the granted set.
-	found := false
-	for _, s := range sawScopes {
-		if s == "widgets:read" {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !slices.Contains(sawScopes, "widgets:read") {
 		t.Fatalf("expected widgets:read in granted scopes, got %v", sawScopes)
 	}
 }

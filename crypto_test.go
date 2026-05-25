@@ -85,6 +85,77 @@ func TestOpenEnvelope_WrongMaster_Fails(t *testing.T) {
 	}
 }
 
+func TestOpenEnvelopeWithKeyring_KidLookup(t *testing.T) {
+	// d9a: an envelope sealed with master A must be openable by a keyring
+	// containing A, even when the active master is a different key B.
+	masterA := makeKey(t)
+	masterB := makeKey(t)
+	sealed, err := sealEnvelope(masterA, "ctx-id-1", "p", []byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, _ := looksLikeEnvelope(sealed)
+
+	keyring := map[string][]byte{
+		fingerprintOf(masterA): masterA,
+		fingerprintOf(masterB): masterB,
+	}
+	pt, needsRewrap, err := openEnvelopeWithKeyring(keyring, fingerprintOf(masterB), "ctx-id-1", "/legacy/dir", "p", env)
+	if err != nil {
+		t.Fatalf("keyring decrypt: %v", err)
+	}
+	if string(pt) != "hello" {
+		t.Errorf("plaintext mismatch: %q", pt)
+	}
+	if !needsRewrap {
+		t.Error("expected needsRewrap=true when envelope.Kid != active master")
+	}
+}
+
+func TestOpenEnvelopeWithKeyring_LegacyDataDirFallback(t *testing.T) {
+	// 15o: envelopes sealed before the ctx-id switch used app.DataDir() as
+	// the HKDF info source. After the switch, the same envelope must
+	// still decrypt via the legacyCtxID fallback, with needsRewrap=true.
+	master := makeKey(t)
+	legacyDataDir := "/var/data/tenant_a"
+	sealed, err := sealEnvelope(master, legacyDataDir, "p", []byte("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, _ := looksLikeEnvelope(sealed)
+
+	keyring := map[string][]byte{fingerprintOf(master): master}
+	newCtxID := "stable-uuid-xyz"
+	pt, needsRewrap, err := openEnvelopeWithKeyring(keyring, fingerprintOf(master), newCtxID, legacyDataDir, "p", env)
+	if err != nil {
+		t.Fatalf("legacy fallback decrypt: %v", err)
+	}
+	if string(pt) != "payload" {
+		t.Errorf("plaintext mismatch: %q", pt)
+	}
+	if !needsRewrap {
+		t.Error("expected needsRewrap=true after legacy-ctxID fallback")
+	}
+
+	// Sanity: with no legacy fallback hint, the same call should fail —
+	// asserts that the test setup actually exercised the fallback path.
+	if _, _, err := openEnvelopeWithKeyring(keyring, fingerprintOf(master), newCtxID, "", "p", env); err == nil {
+		t.Error("expected failure when legacyCtxID is empty")
+	}
+}
+
+func TestOpenEnvelopeWithKeyring_NoMatchFails(t *testing.T) {
+	masterA := makeKey(t)
+	masterB := makeKey(t)
+	sealed, _ := sealEnvelope(masterA, "ctx", "p", []byte("x"))
+	env, _ := looksLikeEnvelope(sealed)
+
+	keyring := map[string][]byte{fingerprintOf(masterB): masterB}
+	if _, _, err := openEnvelopeWithKeyring(keyring, fingerprintOf(masterB), "ctx", "/d", "p", env); err == nil {
+		t.Error("expected failure when keyring lacks the sealing master")
+	}
+}
+
 func TestLooksLikeEnvelope_RejectsPlaintext(t *testing.T) {
 	cases := [][]byte{
 		[]byte(``),
@@ -106,6 +177,7 @@ func TestLooksLikeEnvelope_RejectsPlaintext(t *testing.T) {
 func TestDecodeMasterKey_AcceptsFormats(t *testing.T) {
 	want := bytes.Repeat([]byte{0x11}, 32)
 	cases := map[string]string{
+		"raw-32":      string(want),
 		"hex":         hex.EncodeToString(want),
 		"std-base64":  base64.StdEncoding.EncodeToString(want),
 		"raw-base64":  base64.RawStdEncoding.EncodeToString(want),
@@ -129,7 +201,11 @@ func TestDecodeMasterKey_RejectsBadInput(t *testing.T) {
 	cases := []string{
 		"",
 		"not-a-key",
-		hex.EncodeToString(bytes.Repeat([]byte{0x11}, 16)), // 16 bytes
+		// Wrong-length hex: 31 bytes -> 62 chars, neither raw-32 nor hex-32.
+		hex.EncodeToString(bytes.Repeat([]byte{0x11}, 31)),
+		// Wrong-length base64: 16 bytes -> 24 chars, neither raw-32 nor any
+		// recognized 32-byte encoding.
+		base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 16)),
 	}
 	for _, raw := range cases {
 		if _, err := decodeMasterKey(raw); err == nil {
@@ -189,7 +265,7 @@ func TestEnvelope_JSONShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var raw map[string]interface{}
+	var raw map[string]any
 	if err := json.Unmarshal(sealed, &raw); err != nil {
 		t.Fatal(err)
 	}

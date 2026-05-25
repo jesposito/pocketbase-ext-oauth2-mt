@@ -24,6 +24,13 @@ const ScopeContextKey = "oauth_granted_scopes"
 // "insufficient_scope" 403 with the missing scopes listed in the
 // WWW-Authenticate header.
 //
+// Header-only by design: the token is read from "Authorization: Bearer
+// <token>" only. Form-body and URL-query token parameters are deliberately
+// rejected because URL-query tokens leak into access logs, browser history,
+// and Referer headers (RFC 6750 §5.3 SHOULD-NOT) and form-body tokens
+// trigger CORS preflight in browser clients. If you need form/query token
+// support, use fosite.AccessTokenFromRequest directly in your own middleware.
+//
 // This is opt-in: by default OAuth-issued access tokens are valid PocketBase
 // auth tokens with no scope check on PB-native endpoints. Attach
 // RequireScope to your own resource routes when you want OAuth scope to
@@ -34,7 +41,7 @@ const ScopeContextKey = "oauth_granted_scopes"
 func RequireScope(app core.App, requiredScopes ...string) *hook.Handler[*core.RequestEvent] {
 	return &hook.Handler[*core.RequestEvent]{
 		Func: func(e *core.RequestEvent) error {
-			token := fosite.AccessTokenFromRequest(e.Request)
+			token := bearerTokenFromHeader(e.Request.Header.Get("Authorization"))
 			if token == "" {
 				writeWWWAuthenticate(e, http.StatusUnauthorized,
 					`Bearer realm="OAuth", error="invalid_token", error_description="The access token is missing or malformed."`)
@@ -111,4 +118,19 @@ func writeWWWAuthenticate(e *core.RequestEvent, status int, challenge string) {
 func sanitizeHeaderValue(v string) string {
 	r := strings.NewReplacer("\r", " ", "\n", " ", `"`, "'")
 	return r.Replace(v)
+}
+
+// bearerTokenFromHeader extracts a bearer token from an Authorization header
+// value per RFC 6750 §2.1. The scheme match is case-insensitive ("Bearer",
+// "bearer", "BEARER"); the token itself is returned verbatim. Returns "" if
+// the header is missing, malformed, or uses a different scheme.
+func bearerTokenFromHeader(authz string) string {
+	const prefix = "bearer "
+	if len(authz) <= len(prefix) {
+		return ""
+	}
+	if !strings.EqualFold(authz[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(authz[len(prefix):])
 }

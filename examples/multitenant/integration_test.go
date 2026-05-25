@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -159,6 +160,13 @@ func seedClient(t *testing.T, app core.App, scope string) (clientID, clientPw st
 	// Register() will hash it before it lands in the row. Pre-hashing
 	// would double-hash (existing test helper pre-hashes only because
 	// it's never exercising real client auth at the token endpoint).
+	//
+	// Contract assumption: oauth2.Register() binds an OnRecordCreate hook
+	// for consts.ClientCollectionName that hashes client_secret via
+	// inst.cfg.GetSecretsHasher() and aborts the create on hash error
+	// (see oauth2.go). If that hook is ever changed to NOT hash, this
+	// helper will write plaintext into _oauth2Clients and the token
+	// endpoint's client_secret_post auth will fail.
 	rec := core.NewRecord(c)
 	rec.Set("client_id", clientID)
 	rec.Set("client_name", "Demo Client")
@@ -372,12 +380,7 @@ func TestMultiTenant_DiscoveryIsolation(t *testing.T) {
 		t.Errorf("RFC 9207 flag not advertised: apple=%v banana=%v", da.IssPar, db.IssPar)
 	}
 	formPost := func(modes []string) bool {
-		for _, m := range modes {
-			if m == "form_post" {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(modes, "form_post")
 	}
 	if !formPost(da.Modes) || !formPost(db.Modes) {
 		t.Errorf("form_post not advertised: apple=%v banana=%v", da.Modes, db.Modes)
