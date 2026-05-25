@@ -4,17 +4,25 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ui2</title>
+    <title>Sign in - PocketBase</title>
     <style>
         [x-cloak] { display: none !important; }
+        .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+        .oauth2-scopes-list { list-style: none; padding: 0; margin: 0; }
+        .oauth2-scopes-list li { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
     </style>
   </head>
   <body>
-    <div id="app" x-data="oauth" @alpine:init="oauth.init()">
+    <noscript>
+        <div style="padding: 16px; text-align: center;">
+            This sign-in page requires JavaScript to be enabled in your browser.
+        </div>
+    </noscript>
+    <div id="app" x-data="oauth" @alpine:init="oauth.init()" @keydown.escape.window="onEscape()">
         <div class="app-layout">
             <div class="app-body">
                 <div class="page-wrapper full-page center-content">
-                    <main class="page-content">
+                    <main class="page-content" id="main-content">
                         <div class="wrapper wrapper-sm m-b-xl panel-wrapper">
                             <div class="block txt-center m-b-lg" x-cloak>
                                 <figure class="logo">
@@ -22,62 +30,63 @@
                                     <span class="txt">Pocket<strong>Base</strong></span>
                                 </figure>
                             </div>
-                            <div class="clearfix" />
+                            <div class="clearfix"></div>
                             <div>
                                 <div class="content txt-center m-b-base" x-cloak>
-                                    <h4 x-show="state.authRecord == null">Login</h4>
-                                    <h4 x-show="state.authRecord">
+                                    <h1 class="login-heading" x-show="state.authRecord == null">Sign in</h1>
+                                    <h1 class="login-heading" x-show="state.authRecord">
                                         Welcome back, <span x-text="uiUserLabelShort(state.authRecord)"></span>!<br/>
-                                        <small class="txt-muted">Not you? <a href="#" @click.prevent="switchAccount()">Switch account</a></small>
-                                    </h4>
+                                        <small class="txt-muted">Not you? <button type="button" class="link-hint" @click="switchAccount()">Switch account</button></small>
+                                    </h1>
                                 </div>
                                 <div id="slot">
                                     <!-- Error state -->
-                                    <div x-show="error" class="error" x-text="error" x-cloak></div>
+                                    <div x-show="error" class="error" x-text="error" role="alert" x-cloak></div>
 
                                     <!-- Account selection -->
-                                    <div x-show="showAccountSelection()" class="block" x-cloak>
+                                    <div x-show="showAccountSelection()" class="block" x-cloak data-panel="account-selection" role="group" aria-labelledby="account-selection-heading">
+                                        <h2 id="account-selection-heading" class="sr-only">Choose an account to continue</h2>
                                         <template x-for="(record, index) in state.validAccountsForReq" :key="index">
                                             <button type="button" class="btn btn-lg btn-block btn-next m-b-sm" @click="selectAccount(record)">
                                                 <span class="txt" x-text="uiUserLabel(record)"></span>
-                                                <i class="ri-arrow-right-line"></i>
+                                                <i class="ri-arrow-right-line" aria-hidden="true"></i>
                                             </button>
                                         </template>
                                         <div class="txt-center">
-                                            Or, <small class="txt-muted"><a href="#" @click.prevent="newAccount()">use another account</a></small>
+                                            Or, <small class="txt-muted"><button type="button" class="link-hint" @click="newAccount()">use another account</button></small>
                                         </div>
                                     </div>
 
                                     <!-- Password login form -->
-                                    <form x-show="showLoginPassword()" @submit.prevent="submitAuthWithPassword()" class="block" x-cloak>
+                                    <form x-show="showLoginPassword()" @submit.prevent="submitAuthWithPassword()" class="block" x-cloak data-panel="login-password">
                                         <div class="form-field required">
-                                            <label x-text="uiIdentityLabel()"></label>
-                                            <input x-model="state.passwordLoginForm.identity" :type="isEmailIdentity() ? 'email' : 'text'" required autofocus />
+                                            <label for="field_identity" x-text="uiIdentityLabel()"></label>
+                                            <input id="field_identity" x-model="state.passwordLoginForm.identity" :type="isEmailIdentity() ? 'email' : 'text'" :autocomplete="isEmailIdentity() ? 'username email' : 'username'" required />
                                         </div>
                                         <div class="form-field required">
                                             <label for="field_password">Password</label>
-                                            <input x-model="state.passwordLoginForm.password" type="password" id="field_password" required />
+                                            <input x-model="state.passwordLoginForm.password" type="password" id="field_password" autocomplete="current-password" required />
                                         </div>
-                                        <button type="submit" class="btn btn-lg btn-block btn-next" :disabled="state.passwordLoginForm.submitting">
+                                        <button type="submit" class="btn btn-lg btn-block btn-next" aria-label="Continue with password" :disabled="state.passwordLoginForm.submitting">
                                             <span class="txt">Continue</span>
-                                            <i class="ri-arrow-right-line"></i>
+                                            <i class="ri-arrow-right-line" aria-hidden="true"></i>
                                         </button>
                                     </form>
 
                                     <!-- OTP request form (no otpId yet) -->
-                                    <form x-show="showLoginRequestOtp()" @submit.prevent="requestOTP()" class="block" x-cloak>
+                                    <form x-show="showLoginRequestOtp()" @submit.prevent="requestOTP()" class="block" x-cloak data-panel="otp-request">
                                         <div class="form-field required">
                                             <label for="field_email">Email</label>
-                                            <input x-model="state.otpLoginForm.identity" type="email" id="field_email" required autofocus>
+                                            <input x-model="state.otpLoginForm.identity" type="email" id="field_email" autocomplete="email" required>
                                         </div>
                                         <button type="submit" class="btn btn-lg btn-block btn-next" :disabled="state.otpLoginForm.requesting">
-                                            <i class="ri-mail-send-line"></i>
+                                            <i class="ri-mail-send-line" aria-hidden="true"></i>
                                             <span class="txt">Send OTP</span>
                                         </button>
                                     </form>
 
                                     <!-- OTP auth form (otpId exists) -->
-                                    <div x-show="showLoginOtp()" x-cloak>
+                                    <div x-show="showLoginOtp()" x-cloak data-panel="otp-auth">
                                         <div x-show="state.otpLoginForm.identity" class="content txt-center m-b-sm">
                                             <p>
                                                 Check your <strong x-text="state.otpLoginForm.identity"></strong> inbox and
@@ -87,15 +96,15 @@
                                         <form @submit.prevent="submitAuthWithOTP()" class="block">
                                             <div class="form-field required">
                                                 <label for="field_otpId">Id</label>
-                                                <input x-model="state.otpLoginForm.id" type="text" id="field_otpId" required autofocus>
+                                                <input x-model="state.otpLoginForm.id" type="text" id="field_otpId" required>
                                             </div>
                                             <div class="form-field required">
                                                 <label for="field_otpPassword">One-time password</label>
-                                                <input x-model="state.otpLoginForm.password" type="password" id="field_otpPassword" required>
+                                                <input x-model="state.otpLoginForm.password" type="password" id="field_otpPassword" autocomplete="one-time-code" inputmode="numeric" required>
                                             </div>
-                                            <button type="submit" class="btn btn-lg btn-block btn-next" :disabled="state.otpLoginForm.submitting">
+                                            <button type="submit" class="btn btn-lg btn-block btn-next" aria-label="Continue with one-time password" :disabled="state.otpLoginForm.submitting">
                                                 <span class="txt">Continue</span>
-                                                <i class="ri-arrow-right-line"></i>
+                                                <i class="ri-arrow-right-line" aria-hidden="true"></i>
                                             </button>
                                         </form>
                                         <div class="content txt-center m-t-sm">
@@ -106,36 +115,43 @@
                                     </div>
 
                                     <!-- Consent form -->
-                                    <div x-show="showConsent()" x-cloak>
+                                    <div x-show="showConsent()" x-cloak data-panel="consent">
                                         <form @submit.prevent="submitConsent()" class="block">
                                             <div class="oauth2-consent m-b-lg">
                                                 <div class="txt-center m-b-base">
                                                     <h1 x-text="uiClientNameLabel()"></h1>
-                                                    <hr />
+                                                    <hr role="presentation" />
                                                     <p>
                                                         A third-party application is requesting access to your data.
                                                         Approving this will grant the application full access to your
                                                         data. Please review the requested permissions below before
                                                         continuing.
                                                     </p>
-                                                    <hr />
+                                                    <hr role="presentation" />
                                                 </div>
-                                                <template x-for="scope in (params.requested_scopes || [])">
-                                                    <div class="form-field form-field-checkbox">
-                                                        <input type="checkbox" :id="scope" required checked disabled />
-                                                        <label :for="scope" x-text="scope"></label>
-                                                    </div>
-                                                </template>
+                                                <ul class="oauth2-scopes-list" role="list" aria-label="Permissions being requested">
+                                                    <template x-for="scope in (params.requested_scopes || [])" :key="scope">
+                                                        <li class="form-field form-field-checkbox">
+                                                            <i class="ri-checkbox-circle-fill" aria-hidden="true"></i>
+                                                            <span x-text="scope"></span>
+                                                        </li>
+                                                    </template>
+                                                </ul>
                                             </div>
-                                            <button type="submit" class="btn btn-lg btn-block btn-next" :disabled="state.consentForm.submitting">
-                                                <span class="txt" x-text="uiConsentButtonLabel()"></span>
-                                                <i class="ri-arrow-right-line"></i>
-                                            </button>
+                                            <div class="flex flex-gap-sm">
+                                                <button type="button" class="btn btn-lg btn-block btn-secondary" @click="declineConsent()" :disabled="state.consentForm.submitting">
+                                                    <span class="txt">Cancel</span>
+                                                </button>
+                                                <button type="submit" class="btn btn-lg btn-block btn-next" :disabled="state.consentForm.submitting">
+                                                    <span class="txt" x-text="uiConsentButtonLabel()"></span>
+                                                    <i class="ri-arrow-right-line" aria-hidden="true"></i>
+                                                </button>
+                                            </div>
                                         </form>
                                     </div>
 
                                     <!-- Loading spinner -->
-                                    <div x-show="!error && !state.methods" class="block txt-center">
+                                    <div x-show="!error && !state.methods" class="block txt-center" role="status" aria-label="Loading sign-in options">
                                         <span class="loader"></span>
                                     </div>
                                 </div>
@@ -143,14 +159,14 @@
                         </div>
                     </main>
                 </div>
-                <div class="toasts-wrapper">
-                    <template x-for="toast in $store.toast.toasts">
-                        <div :class="`alert txt-break ${toast.alertClass}`" >
+                <div class="toasts-wrapper" role="region" aria-label="Notifications" aria-live="polite">
+                    <template x-for="toast in $store.toast.toasts" :key="toast.id">
+                        <div :class="`alert txt-break ${toast.alertClass}`" :role="toast.type === 'error' ? 'alert' : 'status'">
                             <div class="icon">
-                                <i :class="toast.iconClass"></i>
+                                <i :class="toast.iconClass" aria-hidden="true"></i>
                             </div>
                             <div class="content" x-text="toast.message"></div>
-                            <button type="button" class="close" @click="$store.toast.removeToast(toast.id)"><i class="ri-close-line"></i></button>
+                            <button type="button" class="close" @click="$store.toast.removeToast(toast.id)" aria-label="Dismiss notification"><i class="ri-close-line" aria-hidden="true"></i></button>
                         </div>
                     </template>
                 </div>

@@ -65,6 +65,9 @@ type LoginState = {
     submitAuthWithOTP: () => Promise<void>;
     requestOTP: () => Promise<void>;
     submitConsent: () => Promise<void>;
+    declineConsent: () => void;
+    onEscape: () => void;
+    focusFirstInPanel: (panelName: string) => void;
     handleSuccessfulLogin: () => void;
     handleSuccessfulConsent: () => void;
     handleErr: (err: any) => void;
@@ -348,6 +351,40 @@ Alpine.data<Partial<LoginState>, any>('oauth', () => {
         async submitConsent() {
             this.state!.consentForm.submitting = true;
             this.handleSuccessfulConsent();
+        },
+
+        // declineConsent redirects the RP with RFC 6749 section 4.1.2.1
+        // error=access_denied so the relying party knows the user explicitly
+        // refused (vs an interaction-required scenario or a tab-close).
+        declineConsent() {
+            postRedirect(this.params.redirect_uri, {
+                error: "access_denied",
+                error_description: "User declined consent",
+            });
+        },
+
+        // onEscape: pressing Escape on the consent panel declines the grant.
+        // On other panels it does nothing so users don't lose form state by
+        // accident.
+        onEscape() {
+            if (this.showConsent && this.showConsent()) {
+                this.declineConsent();
+            }
+        },
+
+        // focusFirstInPanel moves keyboard focus into the named panel so AT
+        // users follow the UI when state transitions swap panels via x-show.
+        // Called by selectAccount, switchAccount, newAccount, and the post-
+        // login consent transition.
+        focusFirstInPanel(panelName: string) {
+            requestAnimationFrame(() => {
+                const panel = document.querySelector(`[data-panel="${panelName}"]`) as HTMLElement | null;
+                if (!panel) return;
+                const target = panel.querySelector(
+                    'input:not([type=hidden]), button[type=submit], h1, h2, [tabindex]:not([tabindex="-1"])'
+                ) as HTMLElement | null;
+                target?.focus();
+            });
         },
 
         //
