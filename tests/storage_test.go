@@ -2,6 +2,7 @@ package oauth2
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -453,19 +454,25 @@ func TestStoreRotateRefreshToken(t *testing.T) {
 	store.CreateAccessTokenSession(ctx, "rotate-access-sig", accessReq)
 	store.CreateRefreshTokenSession(ctx, "rotate-refresh-sig", "rotate-access-sig", refreshReq)
 
-	// Rotate: deletes old refresh token + old access token by request ID
+	// Rotate: marks old refresh token as rotated (still present as a
+	// reuse-detection breadcrumb) and deletes the old access token by
+	// request ID.
 	err := store.RotateRefreshToken(ctx, reqID, "rotate-refresh-sig")
 	if err != nil {
 		t.Fatalf("RotateRefreshToken failed: %v", err)
 	}
 
-	// Old refresh token should be gone
+	// Looking up the rotated refresh token should now report it as
+	// inactive (reuse signal) per the family-tracking contract.
 	_, err = store.GetRefreshTokenSession(ctx, "rotate-refresh-sig", &oauth2.Session{})
 	if err == nil {
-		t.Error("expected old refresh token to be deleted after rotation")
+		t.Error("expected rotated refresh token lookup to fail")
+	}
+	if !errors.Is(err, fosite.ErrInactiveToken) {
+		t.Errorf("expected fosite.ErrInactiveToken after rotation, got %v", err)
 	}
 
-	// Old access token should also be gone
+	// Old access token should be deleted.
 	_, err = store.GetAccessTokenSession(ctx, "rotate-access-sig", &oauth2.Session{})
 	if err == nil {
 		t.Error("expected old access token to be deleted after rotation")
