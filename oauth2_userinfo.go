@@ -1,11 +1,11 @@
 package oauth2
 
 import (
+	"fmt"
 	"net/http"
 	"slices"
 
 	"github.com/ory/fosite"
-	"fmt"
 	"github.com/pocketbase/pocketbase/core"
 )
 
@@ -327,6 +327,11 @@ var _ UserInfoClaimStrategy = (*DefaultUserInfoClaimStrategy)(nil)
 
 func api_OAuth2UserInfo(e *core.RequestEvent, inst *Instance) error {
 	ctx := e.Request.Context()
+	token := fosite.AccessTokenFromRequest(e.Request)
+	authority, err := ValidateAccessTokenAuthorityAt(ctx, e.App, inst.cfg.PathPrefix, token)
+	if err != nil || authority.UserCollection != inst.cfg.UserCollection {
+		return e.UnauthorizedError("invalid OAuth access-token authority", err)
+	}
 
 	// Resolve the granted scopes for this access token by looking the bearer
 	// up via fosite's IntrospectToken. This is what makes /userinfo OIDC-
@@ -334,7 +339,7 @@ func api_OAuth2UserInfo(e *core.RequestEvent, inst *Instance) error {
 	// by what we hope was granted (per OIDC Core 1.0 §5.4 and the
 	// "EnsureUserInfoDoesNotContainName" conformance check).
 	var grantedScopes []string
-	if token := fosite.AccessTokenFromRequest(e.Request); token != "" {
+	if token != "" {
 		sess := NewSession(e.App, "", "")
 		if _, ar, ierr := inst.provider.IntrospectToken(ctx, token, fosite.AccessToken, sess); ierr == nil && ar != nil {
 			grantedScopes = ar.GetGrantedScopes()

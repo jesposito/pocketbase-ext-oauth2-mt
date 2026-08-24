@@ -1,6 +1,7 @@
 package oauth2
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 
 	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
@@ -46,11 +48,17 @@ type Interaction struct {
 	Prompt             string
 	RequestedAt        time.Time
 	ExpiresAt          time.Time
+	ProviderPrefix     string
 }
 
 // CreateInteraction persists a new pending authorization for later
 // completion. Returns the generated interaction id.
 func CreateInteraction(app core.App, in *Interaction) (string, error) {
+	return CreateInteractionAt(app, DefaultPathPrefix, in)
+}
+
+func CreateInteractionAt(app core.App, prefix string, in *Interaction) (string, error) {
+	prefix = normalizePrefix(prefix)
 	c, err := app.FindCollectionByNameOrId(consts.InteractionCollectionName)
 	if err != nil {
 		return "", fmt.Errorf("find interactions collection: %w", err)
@@ -78,6 +86,7 @@ func CreateInteraction(app core.App, in *Interaction) (string, error) {
 	}
 	rec := core.NewRecord(c)
 	rec.Id = in.ID
+	rec.Set("provider_prefix", prefix)
 	rec.Set("client_id", in.ClientID)
 	rec.Set("client_name", in.ClientName)
 	rec.Set("user_collection", in.UserCollection)
@@ -98,11 +107,20 @@ func CreateInteraction(app core.App, in *Interaction) (string, error) {
 // error if the row is missing or expired; in both cases the UI should
 // treat the interaction as gone and force the user back through /auth.
 func FindInteraction(app core.App, id string) (*Interaction, error) {
+	return FindInteractionAt(app, DefaultPathPrefix, id)
+}
+
+func FindInteractionAt(app core.App, prefix, id string) (*Interaction, error) {
 	if id == "" {
 		return nil, errors.New("interaction id is required")
 	}
-	rec, err := app.FindRecordById(consts.InteractionCollectionName, id)
+	c, err := app.FindCachedCollectionByNameOrId(consts.InteractionCollectionName)
 	if err != nil {
+		return nil, fmt.Errorf("find interactions collection: %w", err)
+	}
+	rec := core.NewRecord(c)
+	if err := app.RecordQuery(c).AndWhere(dbx.HashExp{"id": id}).
+		AndWhere(providerPrefixExp(app, prefix)).One(rec); err != nil {
 		return nil, fmt.Errorf("find interaction %q: %w", id, err)
 	}
 	exp := rec.GetInt("expires_at")
@@ -129,17 +147,59 @@ func FindInteraction(app core.App, id string) (*Interaction, error) {
 		Prompt:             rec.GetString("prompt"),
 		RequestedAt:        time.Unix(int64(rec.GetInt("requested_at")), 0).UTC(),
 		ExpiresAt:          time.Unix(int64(exp), 0).UTC(),
+		ProviderPrefix:     normalizePrefix(prefix),
 	}, nil
 }
 
 // DeleteInteraction removes a completed (or denied) interaction row so
 // it cannot be replayed.
 func DeleteInteraction(app core.App, id string) error {
-	rec, err := app.FindRecordById(consts.InteractionCollectionName, id)
+	return DeleteInteractionAt(app, DefaultPathPrefix, id)
+}
+
+func DeleteInteractionAt(app core.App, prefix, id string) error {
+	c, err := app.FindCachedCollectionByNameOrId(consts.InteractionCollectionName)
 	if err != nil {
-		return nil // already gone
+		return err
+	}
+	rec := core.NewRecord(c)
+	err = app.RecordQuery(c).AndWhere(dbx.HashExp{"id": id}).
+		AndWhere(providerPrefixExp(app, prefix)).One(rec)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
 	}
 	return app.Delete(rec)
+}
+
+// ConsumeInteractionAt atomically claims a pending interaction for one
+// completion attempt. Only the caller that deletes the exact scoped row may
+// continue; concurrent replays observe zero rows affected and fail closed.
+func ConsumeInteractionAt(app core.App, prefix, id string) (*Interaction, error) {
+	in, err := FindInteractionAt(app, prefix, id)
+	if err != nil {
+		return nil, err
+	}
+	prefix = normalizePrefix(prefix)
+	prefixClause := "[[provider_prefix]] = {:prefix}"
+	if legacyDefaultAllowed(app, prefix) {
+		prefixClause = "([[provider_prefix]] = {:prefix} OR [[provider_prefix]] = '')"
+	}
+	result, err := app.DB().NewQuery("DELETE FROM {{" + consts.InteractionCollectionName + "}} WHERE [[id]] = {:id} AND " + prefixClause).
+		Bind(dbx.Params{"id": id, "prefix": prefix}).Execute()
+	if err != nil {
+		return nil, fmt.Errorf("consume interaction %q: %w", id, err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("consume interaction %q result: %w", id, err)
+	}
+	if n != 1 {
+		return nil, errors.New("interaction already consumed")
+	}
+	return in, nil
 }
 
 // Consent represents a single user's explicit grant of a scope set to a
@@ -153,20 +213,24 @@ type Consent struct {
 	ClientID       string
 	GrantedScopes  []string
 	GrantedAt      time.Time
+	ProviderPrefix string
 }
 
 // FindConsent returns the most recent consent row for (user, client) or
 // (nil, nil) if none exists.
 func FindConsent(app core.App, userID, userCollection, clientID string) (*Consent, error) {
-	records, err := app.FindRecordsByFilter(
-		consts.ConsentCollectionName,
-		"user_id = {:user} && user_collection = {:coll} && client_id = {:client}",
-		"-granted_at",
-		1,
-		0,
-		map[string]any{"user": userID, "coll": userCollection, "client": clientID},
-	)
+	return FindConsentAt(app, DefaultPathPrefix, userID, userCollection, clientID)
+}
+
+func FindConsentAt(app core.App, prefix, userID, userCollection, clientID string) (*Consent, error) {
+	c, err := app.FindCachedCollectionByNameOrId(consts.ConsentCollectionName)
 	if err != nil {
+		return nil, fmt.Errorf("find consents collection: %w", err)
+	}
+	var records []*core.Record
+	if err := app.RecordQuery(c).AndWhere(dbx.HashExp{
+		"user_id": userID, "user_collection": userCollection, "client_id": clientID,
+	}).AndWhere(providerPrefixExp(app, prefix)).OrderBy("granted_at DESC").Limit(1).All(&records); err != nil {
 		return nil, fmt.Errorf("query consents: %w", err)
 	}
 	if len(records) == 0 {
@@ -182,13 +246,19 @@ func FindConsent(app core.App, userID, userCollection, clientID string) (*Consen
 		ClientID:       rec.GetString("client_id"),
 		GrantedScopes:  granted,
 		GrantedAt:      time.Unix(int64(rec.GetInt("granted_at")), 0).UTC(),
+		ProviderPrefix: normalizePrefix(prefix),
 	}, nil
 }
 
 // UpsertConsent merges newly-granted scopes into the (user, client) row,
 // creating it if absent. Returns the merged Consent.
 func UpsertConsent(app core.App, userID, userCollection, clientID string, newScopes []string) (*Consent, error) {
-	existing, err := FindConsent(app, userID, userCollection, clientID)
+	return UpsertConsentAt(app, DefaultPathPrefix, userID, userCollection, clientID, newScopes)
+}
+
+func UpsertConsentAt(app core.App, prefix, userID, userCollection, clientID string, newScopes []string) (*Consent, error) {
+	prefix = normalizePrefix(prefix)
+	existing, err := FindConsentAt(app, prefix, userID, userCollection, clientID)
 	if err != nil {
 		return nil, err
 	}
@@ -216,6 +286,7 @@ func UpsertConsent(app core.App, userID, userCollection, clientID string, newSco
 		rec.Set("user_id", userID)
 		rec.Set("user_collection", userCollection)
 		rec.Set("client_id", clientID)
+		rec.Set("provider_prefix", prefix)
 	}
 	rec.Set("granted_scopes", string(scopesJSON))
 	rec.Set("granted_at", now.Unix())
@@ -229,6 +300,7 @@ func UpsertConsent(app core.App, userID, userCollection, clientID string, newSco
 		ClientID:       clientID,
 		GrantedScopes:  merged,
 		GrantedAt:      now,
+		ProviderPrefix: prefix,
 	}, nil
 }
 

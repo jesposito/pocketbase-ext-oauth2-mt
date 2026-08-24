@@ -7,6 +7,7 @@ import (
 	"time"
 
 	oauth2 "github.com/jesposito/pocketbase-ext-oauth2-mt"
+	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
 	"github.com/ory/fosite"
 	fositeoauth2 "github.com/ory/fosite/handler/oauth2"
 	fositeopenid "github.com/ory/fosite/handler/openid"
@@ -159,6 +160,41 @@ func TestAccessTokenValidate_Revoked(t *testing.T) {
 	}
 	if !errors.Is(err, fosite.ErrInactiveToken) {
 		t.Errorf("expected ErrInactiveToken, got %v", err)
+	}
+}
+
+func TestAccessTokenValidate_TerminalRefreshAuthorityRejectsLiveRow(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+
+	user := seedTestUser(t, app)
+	seedTestClient(t, app)
+	strategy := oauth2.NewPocketBaseStrategy(app, oauth2.GetOAuth2Config(app))
+	session := &oauth2.Session{
+		DefaultSession: fositeopenid.DefaultSession{
+			Claims:  &jwt.IDTokenClaims{Subject: user.Id, ExpiresAt: time.Now().Add(time.Hour)},
+			Headers: &jwt.Headers{},
+			Subject: user.Id,
+		},
+		CollectionId: user.Collection().Id,
+	}
+	req := &fosite.Request{Client: &fosite.DefaultClient{ID: testClientID}, Session: session}
+	token, signature, err := strategy.GenerateAccessToken(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedAccessTokenRow(t, app, token, "openid")
+	requestID := "test-req-" + signature[:8]
+	if err := oauth2.NewOAuth2Store(app).RevokeRefreshToken(context.Background(), requestID); err != nil {
+		t.Fatal(err)
+	}
+	// No refresh seed existed, so the synthetic access row remains and proves
+	// CoreStrategy validates terminal authority rather than row presence alone.
+	if _, err := app.FindFirstRecordByFilter(consts.AccessCollectionName, "signature = {:sig}", map[string]any{"sig": signature}); err != nil {
+		t.Fatalf("live access row missing: %v", err)
+	}
+	if err := strategy.ValidateAccessToken(context.Background(), req, token); !errors.Is(err, fosite.ErrInactiveToken) {
+		t.Fatalf("terminal access validation error=%v, want ErrInactiveToken", err)
 	}
 }
 

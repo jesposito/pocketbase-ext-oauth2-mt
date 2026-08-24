@@ -20,13 +20,19 @@ type PocketBaseStrategy struct {
 		fosite.JWTScopeFieldProvider
 	}
 	HMACSHAStrategy fositeoauth2.CoreStrategy
+	ProviderPrefix  string
 }
 
 func NewPocketBaseStrategy(app core.App, config fosite.Configurator) *PocketBaseStrategy {
+	return NewPocketBaseStrategyAt(app, config, DefaultPathPrefix)
+}
+
+func NewPocketBaseStrategyAt(app core.App, config fosite.Configurator, prefix string) *PocketBaseStrategy {
 	return &PocketBaseStrategy{
 		App:             app,
 		Config:          config,
 		HMACSHAStrategy: compose.NewOAuth2HMACStrategy(config),
+		ProviderPrefix:  normalizePrefix(prefix),
 	}
 }
 
@@ -60,9 +66,10 @@ func (s *PocketBaseStrategy) GenerateAccessToken(ctx context.Context, requester 
 
 // ValidateAccessToken implements [oauth2.CoreStrategy].
 //
-// Two checks: (1) the PB native JWT must validate (cryptographic + expiry),
-// and (2) the corresponding _oauth2Access session row must still exist.
-// The second check is what makes /oauth2/revoke actually effective for
+// Three checks: (1) the PB native JWT must validate (cryptographic + expiry),
+// (2) the corresponding _oauth2Access session row must still exist, and
+// (3) no durable refresh-family terminal authority may cover its request.
+// The storage checks are what make /oauth2/revoke actually effective for
 // callers that reach this function (fosite introspection + the local
 // RequireScope middleware). PB-native routes that use apis.RequireAuth()
 // bypass this entirely — wire RevokedTokenGuard() on those routes when
@@ -75,13 +82,14 @@ func (s *PocketBaseStrategy) ValidateAccessToken(ctx context.Context, requester 
 	if signature == "" {
 		return fosite.ErrInvalidTokenFormat
 	}
-	if _, err := findSessionModelBySignature(s.App, &AccessTokenModel{}, signature); err != nil {
+	row, err := findSessionModelBySignature(s.App, s.ProviderPrefix, &AccessTokenModel{}, signature)
+	if err != nil {
 		if errors.Is(err, fosite.ErrNotFound) {
 			return fosite.ErrInactiveToken
 		}
 		return err
 	}
-	return nil
+	return assertRefreshFamilyAllowsAccess(s.App, s.ProviderPrefix, row.GetRequestID())
 }
 
 // REFRESH TOKEN

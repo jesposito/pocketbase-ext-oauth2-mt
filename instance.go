@@ -43,6 +43,13 @@ func normalizePrefix(prefix string) string {
 	if prefix == "" {
 		return DefaultPathPrefix
 	}
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	prefix = strings.TrimRight(prefix, "/")
+	if prefix == "" {
+		return DefaultPathPrefix
+	}
 	return prefix
 }
 

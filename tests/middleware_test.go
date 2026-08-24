@@ -1,6 +1,7 @@
 package oauth2
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -29,7 +30,16 @@ func seedAccessTokenRow(t testing.TB, app core.App, token, granted string) {
 		t.Fatalf("find access collection: %v", err)
 	}
 	rec := core.NewRecord(c)
+	auth, err := app.FindAuthRecordByToken(token, core.TokenTypeAuth)
+	if err != nil {
+		t.Fatalf("validate access token auth record: %v", err)
+	}
+	sessionJSON, err := json.Marshal(oauth2.NewSession(app, auth.Id, auth.Collection().Id))
+	if err != nil {
+		t.Fatalf("marshal access session: %v", err)
+	}
 	rec.Set("signature", signature)
+	rec.Set("provider_prefix", oauth2.DefaultPathPrefix)
 	rec.Set("client_id", testClientID)
 	rec.Set("request_id", "test-req-"+signature[:8])
 	rec.Set("requested_at", time.Now().Unix())
@@ -40,8 +50,8 @@ func seedAccessTokenRow(t testing.TB, app core.App, token, granted string) {
 	rec.Set("granted_audience", "")
 	rec.Set("form_data", "")
 	// Minimal valid JSON so ToRequest's json.Unmarshal succeeds.
-	rec.Set("session_data", "{}")
-	rec.Set("subject", "")
+	rec.Set("session_data", string(sessionJSON))
+	rec.Set("subject", auth.Id)
 
 	if err := app.SaveNoValidate(rec); err != nil {
 		t.Fatalf("save access token row: %v", err)
@@ -263,6 +273,38 @@ func TestRevokedTokenGuard_NoToken_Returns401(t *testing.T) {
 	}
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 for missing bearer, got %d", rec.Code)
+	}
+}
+
+func TestRevokedTokenGuard_TerminalRefreshAuthorityRejectsLiveRealToken(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+	seedTestUser(t, app)
+	seedTestClient(t, app)
+
+	bearer := mintBearerForUser(t, app)
+	seedAccessTokenRow(t, app, bearer, "openid")
+	parts := strings.Split(bearer, ".")
+	requestID := "test-req-" + parts[2][:8]
+	if err := oauth2.NewOAuth2Store(app).RevokeRefreshToken(t.Context(), requestID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.FindFirstRecordByFilter(consts.AccessCollectionName, "signature = {:sig}", map[string]any{"sig": parts[2]}); err != nil {
+		t.Fatalf("live access row missing: %v", err)
+	}
+
+	mw := oauth2.RevokedTokenGuard(app)
+	req := httptest.NewRequest(http.MethodGet, "/p", nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	rec := httptest.NewRecorder()
+	e := &core.RequestEvent{App: app}
+	e.Request = req
+	e.Response = rec
+	if err := mw.Func(e); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("terminal access passed guard: status=%d", rec.Code)
 	}
 }
 

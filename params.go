@@ -2,25 +2,27 @@ package oauth2
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 
 	"github.com/go-jose/go-jose/v3"
 	"github.com/google/uuid"
-	"fmt"
-	"errors"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/types"
 )
 
 const (
-	paramsKeyOAuth2RSAKey         = "oauth2_rsa_key"
-	paramsKeyOAuth2GlobalSecret   = "oauth2_global_secret"
-	paramsKeyOAuth2EnvelopeCtxID  = "oauth2_envelope_ctx_id"
+	paramsKeyOAuth2RSAKey        = "oauth2_rsa_key"
+	paramsKeyOAuth2GlobalSecret  = "oauth2_global_secret"
+	paramsKeyOAuth2EnvelopeCtxID = "oauth2_envelope_ctx_id"
 )
 
 // activeMasterKeyProvider returns the provider configured on the registered
@@ -28,7 +30,11 @@ const (
 // when the instance is absent (tests that call loadParam* directly without
 // going through Register, or first-boot edge cases).
 func activeMasterKeyProvider(app core.App) MasterKeyProvider {
-	if inst, ok := getInstance(app); ok && inst.cfg != nil && inst.cfg.MasterKeyProvider != nil {
+	return activeMasterKeyProviderAt(app, DefaultPathPrefix)
+}
+
+func activeMasterKeyProviderAt(app core.App, prefix string) MasterKeyProvider {
+	if inst, ok := getInstanceAt(app, prefix); ok && inst.cfg != nil && inst.cfg.MasterKeyProvider != nil {
 		return inst.cfg.MasterKeyProvider
 	}
 	return DefaultMasterKeyProvider
@@ -108,7 +114,20 @@ const rsaSigningKeyBits = 3072
 // other related operations. The key is stored in the internal app _params table to ensure it
 // persists across application restarts.
 func loadPrivateKeyFromAppStorage(app core.App) (*jose.JSONWebKey, error) {
-	return loadParamFromAppStorage(app, paramsKeyOAuth2RSAKey, &jose.JSONWebKey{}, func() (*jose.JSONWebKey, error) {
+	return loadPrivateKeyFromAppStorageAt(app, DefaultPathPrefix)
+}
+
+func providerParamID(base, prefix string) string {
+	prefix = normalizePrefix(prefix)
+	if prefix == DefaultPathPrefix {
+		return base
+	}
+	sum := sha256.Sum256([]byte(prefix))
+	return fmt.Sprintf("%s_%x", base, sum[:12])
+}
+
+func loadPrivateKeyFromAppStorageAt(app core.App, prefix string) (*jose.JSONWebKey, error) {
+	return loadParamFromAppStorageAt(app, prefix, providerParamID(paramsKeyOAuth2RSAKey, prefix), &jose.JSONWebKey{}, func() (*jose.JSONWebKey, error) {
 		// No existing key found, generate a new one
 		privateKey, err := rsa.GenerateKey(rand.Reader, rsaSigningKeyBits)
 		if err != nil {
@@ -128,7 +147,11 @@ func loadPrivateKeyFromAppStorage(app core.App) (*jose.JSONWebKey, error) {
 // a new one if it doesn't exist. The global secret is used for various cryptographic operations
 // within the OAuth2 plugin, such as signing tokens, etc.
 func loadGlobalSecretFromAppStorage(app core.App) ([]byte, error) {
-	return loadParamFromAppStorage(app, paramsKeyOAuth2GlobalSecret, []byte{}, func() ([]byte, error) {
+	return loadGlobalSecretFromAppStorageAt(app, DefaultPathPrefix)
+}
+
+func loadGlobalSecretFromAppStorageAt(app core.App, prefix string) ([]byte, error) {
+	root, err := loadParamFromAppStorageAt(app, prefix, paramsKeyOAuth2GlobalSecret, []byte{}, func() ([]byte, error) {
 		// No existing secret found, generate a new one
 		ret := make([]byte, 32)
 		if _, err := rand.Read(ret); err != nil {
@@ -136,6 +159,16 @@ func loadGlobalSecretFromAppStorage(app core.App) ([]byte, error) {
 		}
 		return ret, nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	prefix = normalizePrefix(prefix)
+	if prefix == DefaultPathPrefix {
+		return root, nil
+	}
+	mac := hmac.New(sha256.New, root)
+	_, _ = mac.Write([]byte("pocketbase-ext-oauth2-mt/provider-secret/v1\x00" + prefix))
+	return mac.Sum(nil), nil
 }
 
 //
@@ -302,9 +335,13 @@ func updateParamValueCAS(app core.App, paramID string, raw []byte, expectedValue
 //     unset, this returns an error -- you cannot read encrypted data
 //     without the key that produced it.
 func loadParamFromAppStorage[T any](app core.App, paramId string, value T, generator func() (T, error)) (T, error) {
+	return loadParamFromAppStorageAt(app, DefaultPathPrefix, paramId, value, generator)
+}
+
+func loadParamFromAppStorageAt[T any](app core.App, prefix, paramId string, value T, generator func() (T, error)) (T, error) {
 	var zero T
 
-	provider := activeMasterKeyProvider(app)
+	provider := activeMasterKeyProviderAt(app, prefix)
 	ctx := context.Background()
 	master, err := provider.Master(ctx)
 	if err != nil {

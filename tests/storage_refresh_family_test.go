@@ -2,7 +2,9 @@ package oauth2
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -291,15 +293,534 @@ func TestRefreshFamily_RevokeMarksNotDeletes(t *testing.T) {
 	}
 }
 
-// TestRefreshFamily_ConcurrentRotation_AtMostOneWinner verifies the race
-// fix on RotateRefreshToken. N goroutines all try to rotate the same
-// predecessor refresh signature simultaneously. Exactly ONE must succeed
-// (drives the active→rotated transition) and every other caller must
-// receive fosite.ErrSerializationFailure. Without the conditional UPDATE
-// fix, multiple callers could all observe status=active in
-// GetRefreshTokenSession, then all silently no-op in markRefreshRotated's
-// pre-fix "already rotated → return nil" branch, allowing the upstream
-// refresh-grant handler to mint sibling children from the same parent.
+func TestRefreshFamily_RevokeCoversRotatedFamilyAndAccess(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+	seedTestClient(t, app)
+	store := oauth2.NewOAuth2Store(app)
+	ctx := context.Background()
+	session := makeRefreshSession("revoke-rotated-user")
+	reqID := "revoke-rotated-request"
+	req := &fosite.Request{ID: reqID, Client: &fosite.DefaultClient{ID: testClientID}, Session: session}
+	if err := store.CreateAccessTokenSession(ctx, "revoke-access-0", req); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRefreshTokenSession(ctx, "revoke-refresh-0", "revoke-access-0", req); err != nil {
+		t.Fatal(err)
+	}
+	rotate(t, store, ctx, reqID, "revoke-refresh-0", "revoke-refresh-1", "revoke-access-1", session)
+	rotate(t, store, ctx, reqID, "revoke-refresh-1", "revoke-refresh-2", "revoke-access-2", session)
+	if err := store.RevokeRefreshToken(ctx, reqID); err != nil {
+		t.Fatalf("revoke family: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		row := loadRefreshRow(t, app, fmt.Sprintf("revoke-refresh-%d", i))
+		if got := row.GetString("status"); got != oauth2.RefreshStatusRevoked {
+			t.Errorf("row %d status=%q", i, got)
+		}
+	}
+	if _, err := app.FindFirstRecordByFilter(consts.AccessCollectionName, "request_id = {:id}", dbx.Params{"id": reqID}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("associated access rows remain or lookup failed: %v", err)
+	}
+}
+
+func TestRefreshFamily_ReuseInvalidationFailuresRollbackAndPropagate(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		failDelete bool
+	}{
+		{name: "save"}, {name: "delete", failDelete: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := setupTestApp(t)
+			defer app.Cleanup()
+			seedTestClient(t, app)
+			store := oauth2.NewOAuth2Store(app)
+			ctx := context.Background()
+			session := makeRefreshSession("fault-" + tc.name)
+			reqID := "fault-request-" + tc.name
+			req := &fosite.Request{ID: reqID, Client: &fosite.DefaultClient{ID: testClientID}, Session: session}
+			if err := store.CreateAccessTokenSession(ctx, "fault-access-0-"+tc.name, req); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateRefreshTokenSession(ctx, "fault-refresh-0-"+tc.name, "", req); err != nil {
+				t.Fatal(err)
+			}
+			rotate(t, store, ctx, reqID, "fault-refresh-0-"+tc.name, "fault-refresh-1-"+tc.name, "fault-access-1-"+tc.name, session)
+			sentinel := errors.New("injected family " + tc.name + " failure")
+			if tc.failDelete {
+				app.OnRecordDelete(consts.AccessCollectionName).BindFunc(func(e *core.RecordEvent) error { return sentinel })
+			} else {
+				app.OnRecordUpdate(consts.RefreshCollectionName).BindFunc(func(e *core.RecordEvent) error {
+					if e.Record.GetString("status") == oauth2.RefreshStatusReused {
+						return sentinel
+					}
+					return e.Next()
+				})
+			}
+			_, err := store.GetRefreshTokenSession(ctx, "fault-refresh-0-"+tc.name, &oauth2.Session{})
+			if err == nil || !errors.Is(err, sentinel) {
+				t.Fatalf("reuse error=%v, want wrapped %q", err, sentinel)
+			}
+			root := loadRefreshRow(t, app, "fault-refresh-0-"+tc.name)
+			child := loadRefreshRow(t, app, "fault-refresh-1-"+tc.name)
+			if root.GetString("status") != oauth2.RefreshStatusRotated || child.GetString("status") != oauth2.RefreshStatusActive {
+				t.Fatalf("failed transaction partially mutated family: root=%s child=%s", root.GetString("status"), child.GetString("status"))
+			}
+			if _, err := app.FindFirstRecordByFilter(consts.AccessCollectionName, "request_id = {:id}", dbx.Params{"id": reqID}); err != nil {
+				t.Fatalf("failed transaction deleted access row: %v", err)
+			}
+			// Cleanup rolled back, but the separately committed request tombstone
+			// must still make every physically surviving access row unusable.
+			if _, err := store.GetAccessTokenSession(ctx, "fault-access-1-"+tc.name, &oauth2.Session{}); !errors.Is(err, fosite.ErrInactiveToken) {
+				t.Fatalf("surviving access error=%v, want ErrInactiveToken", err)
+			}
+		})
+	}
+}
+
+// TestRefreshFamily_TerminalAuthorityWinsRotateCreateGap uses explicit channel
+// barriers around the same three separate calls Fosite makes during refresh:
+// RotateRefreshToken, CreateAccessTokenSession, CreateRefreshTokenSession.
+// Reuse or revocation is injected after the winning rotate and before the two
+// creates. The winner must not resurrect a new active root/child and its
+// candidate access row must be removed.
+func TestRefreshFamily_TerminalAuthorityWinsRotateCreateGap(t *testing.T) {
+	tests := []struct {
+		name       string
+		seedChild  bool
+		invalidate func(t *testing.T, store *oauth2.OAuth2Store, ctx context.Context, requestID, winnerSig, rootSig string)
+		wantStatus string
+	}{
+		{
+			name: "same-token CAS loser",
+			invalidate: func(t *testing.T, store *oauth2.OAuth2Store, ctx context.Context, requestID, winnerSig, _ string) {
+				t.Helper()
+				if err := store.RotateRefreshToken(ctx, requestID, winnerSig); !errors.Is(err, fosite.ErrInactiveToken) {
+					t.Fatalf("CAS loser error=%v, want ErrInactiveToken", err)
+				}
+			},
+			wantStatus: oauth2.RefreshStatusReused,
+		},
+		{
+			name: "same-token lookup replay",
+			invalidate: func(t *testing.T, store *oauth2.OAuth2Store, ctx context.Context, requestID, winnerSig, _ string) {
+				t.Helper()
+				if _, err := store.GetRefreshTokenSession(ctx, winnerSig, &oauth2.Session{}); !errors.Is(err, fosite.ErrInactiveToken) {
+					t.Fatalf("same-token replay error=%v, want ErrInactiveToken", err)
+				}
+				if err := store.DeleteRefreshTokenSession(ctx, winnerSig); err != nil {
+					t.Fatalf("delete reused signature: %v", err)
+				}
+				if err := store.RevokeRefreshToken(ctx, requestID); err != nil {
+					t.Fatalf("revoke replayed family: %v", err)
+				}
+				if err := store.RevokeAccessToken(ctx, requestID); err != nil {
+					t.Fatalf("revoke replayed access: %v", err)
+				}
+			},
+			wantStatus: oauth2.RefreshStatusRevoked,
+		},
+		{
+			name:      "older-token replay",
+			seedChild: true,
+			invalidate: func(t *testing.T, store *oauth2.OAuth2Store, ctx context.Context, requestID, _, rootSig string) {
+				t.Helper()
+				if _, err := store.GetRefreshTokenSession(ctx, rootSig, &oauth2.Session{}); !errors.Is(err, fosite.ErrInactiveToken) {
+					t.Fatalf("older-token replay error=%v, want ErrInactiveToken", err)
+				}
+				// Mirror Fosite's handleRefreshTokenReuse cleanup. The reused
+				// signature must remain as a terminal tombstone through these
+				// separate calls so the paused winner cannot create a new root.
+				if err := store.DeleteRefreshTokenSession(ctx, rootSig); err != nil {
+					t.Fatalf("delete reused signature: %v", err)
+				}
+				if err := store.RevokeRefreshToken(ctx, requestID); err != nil {
+					t.Fatalf("revoke replayed family: %v", err)
+				}
+				if err := store.RevokeAccessToken(ctx, requestID); err != nil {
+					t.Fatalf("revoke replayed access: %v", err)
+				}
+			},
+			wantStatus: oauth2.RefreshStatusRevoked,
+		},
+		{
+			name: "explicit revoke",
+			invalidate: func(t *testing.T, store *oauth2.OAuth2Store, ctx context.Context, requestID, _, _ string) {
+				t.Helper()
+				if err := store.RevokeRefreshToken(ctx, requestID); err != nil {
+					t.Fatalf("revoke in Rotate/Create gap: %v", err)
+				}
+			},
+			wantStatus: oauth2.RefreshStatusRevoked,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			app := setupTestApp(t)
+			defer app.Cleanup()
+			seedTestClient(t, app)
+			store := oauth2.NewOAuth2Store(app)
+			ctx := context.Background()
+			session := makeRefreshSession("gap-" + tc.name)
+			requestID := "gap-request-" + tc.name
+			req := &fosite.Request{ID: requestID, Client: &fosite.DefaultClient{ID: testClientID}, Session: session}
+			rootSig := "gap-root-" + tc.name
+			winnerSig := rootSig
+			if err := store.CreateAccessTokenSession(ctx, "gap-access-root-"+tc.name, req); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateRefreshTokenSession(ctx, rootSig, "gap-access-root-"+tc.name, req); err != nil {
+				t.Fatal(err)
+			}
+			if tc.seedChild {
+				winnerSig = "gap-child-" + tc.name
+				rotate(t, store, ctx, requestID, rootSig, winnerSig, "gap-access-child-"+tc.name, session)
+			}
+
+			rotated := make(chan error, 1)
+			resume := make(chan struct{})
+			winnerDone := make(chan error, 1)
+			candidateAccess := "gap-access-candidate-" + tc.name
+			candidateRefresh := "gap-refresh-candidate-" + tc.name
+			go func() {
+				if err := store.RotateRefreshToken(ctx, requestID, winnerSig); err != nil {
+					rotated <- err
+					return
+				}
+				rotated <- nil
+				<-resume
+				if err := store.CreateAccessTokenSession(ctx, candidateAccess, req); err != nil {
+					winnerDone <- fmt.Errorf("candidate access: %w", err)
+					return
+				}
+				winnerDone <- store.CreateRefreshTokenSession(ctx, candidateRefresh, candidateAccess, req)
+			}()
+
+			if err := <-rotated; err != nil {
+				t.Fatalf("winning rotate: %v", err)
+			}
+			tc.invalidate(t, store, ctx, requestID, winnerSig, rootSig)
+			close(resume)
+			if err := <-winnerDone; !errors.Is(err, fosite.ErrInactiveToken) {
+				t.Fatalf("winner replacement error=%v, want ErrInactiveToken", err)
+			}
+
+			rows, err := app.FindAllRecords(consts.RefreshCollectionName, dbx.HashExp{"request_id": requestID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range rows {
+				if got := row.GetString("status"); got != tc.wantStatus {
+					t.Errorf("refresh %q status=%q, want %q", row.GetString("signature"), got, tc.wantStatus)
+				}
+				if row.GetString("signature") == candidateRefresh {
+					t.Error("candidate refresh survived terminal authority")
+				}
+			}
+			if _, err := store.GetAccessTokenSession(ctx, candidateAccess, &oauth2.Session{}); !errors.Is(err, fosite.ErrNotFound) {
+				t.Fatalf("candidate access error=%v, want ErrNotFound", err)
+			}
+		})
+	}
+}
+
+func TestRefreshFamily_PredecessorDeletedBetweenReadAndRotateFailsClosed(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+	seedTestClient(t, app)
+	store := oauth2.NewOAuth2Store(app)
+	ctx := context.Background()
+	requestID := "deleted-predecessor-request"
+	req := &fosite.Request{ID: requestID, Client: &fosite.DefaultClient{ID: testClientID}, Session: makeRefreshSession("deleted-predecessor")}
+	if err := store.CreateAccessTokenSession(ctx, "deleted-predecessor-access", req); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRefreshTokenSession(ctx, "deleted-predecessor-refresh", "deleted-predecessor-access", req); err != nil {
+		t.Fatal(err)
+	}
+	// First request has already read and validated the refresh session.
+	if _, err := store.GetRefreshTokenSession(ctx, "deleted-predecessor-refresh", &oauth2.Session{}); err != nil {
+		t.Fatal(err)
+	}
+	// Cleanup wins before that request reaches Rotate.
+	if err := store.DeleteRefreshTokenSession(ctx, "deleted-predecessor-refresh"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RotateRefreshToken(ctx, requestID, "deleted-predecessor-refresh"); !errors.Is(err, fosite.ErrInactiveToken) {
+		t.Fatalf("missing predecessor rotation error=%v, want ErrInactiveToken", err)
+	}
+	if _, err := store.GetAccessTokenSession(ctx, "deleted-predecessor-access", &oauth2.Session{}); !errors.Is(err, fosite.ErrNotFound) {
+		t.Fatalf("predecessor access error=%v, want ErrNotFound", err)
+	}
+
+	// Even if a paused/misbehaving caller ignores Rotate's error, the durable
+	// request tombstone refuses both the late access and a fallback root.
+	if err := store.CreateAccessTokenSession(ctx, "deleted-predecessor-late-access", req); !errors.Is(err, fosite.ErrInactiveToken) {
+		t.Fatalf("late access create error=%v, want ErrInactiveToken", err)
+	}
+	if err := store.CreateRefreshTokenSession(ctx, "deleted-predecessor-late-refresh", "deleted-predecessor-late-access", req); !errors.Is(err, fosite.ErrInactiveToken) {
+		t.Fatalf("late root error=%v, want ErrInactiveToken", err)
+	}
+	if _, err := app.FindFirstRecordByFilter(
+		consts.RefreshCollectionName,
+		"signature = {:sig}",
+		dbx.Params{"sig": "deleted-predecessor-late-refresh"},
+	); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("late root exists or lookup failed: %v", err)
+	}
+	if _, err := store.GetAccessTokenSession(ctx, "deleted-predecessor-late-access", &oauth2.Session{}); !errors.Is(err, fosite.ErrNotFound) {
+		t.Fatalf("late access error=%v, want ErrNotFound", err)
+	}
+}
+
+func TestRefreshFamily_TerminalCreateCleanupFailurePropagatesAndAccessFailsClosed(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+	seedTestClient(t, app)
+	store := oauth2.NewOAuth2Store(app)
+	ctx := context.Background()
+	session := makeRefreshSession("terminal-cleanup-fault")
+	requestID := "terminal-cleanup-fault-request"
+	req := &fosite.Request{ID: requestID, Client: &fosite.DefaultClient{ID: testClientID}, Session: session}
+	if err := store.CreateRefreshTokenSession(ctx, "terminal-cleanup-root", "", req); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateAccessTokenSession(ctx, "terminal-cleanup-access", req); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("injected terminal access cleanup failure")
+	app.OnRecordDelete(consts.AccessCollectionName).BindFunc(func(e *core.RecordEvent) error {
+		if e.Record.GetString("signature") == "terminal-cleanup-access" {
+			return sentinel
+		}
+		return e.Next()
+	})
+	if err := store.RevokeRefreshToken(ctx, requestID); !errors.Is(err, sentinel) {
+		t.Fatalf("revoke error=%v, want wrapped cleanup failure", err)
+	}
+	if err := store.CreateRefreshTokenSession(ctx, "terminal-cleanup-child", "terminal-cleanup-access", req); !errors.Is(err, sentinel) {
+		t.Fatalf("create error=%v, want wrapped cleanup failure", err)
+	}
+	if _, err := app.FindFirstRecordByFilter(
+		consts.RefreshCollectionName,
+		"signature = {:sig}",
+		dbx.Params{"sig": "terminal-cleanup-child"},
+	); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("terminal child exists or lookup failed: %v", err)
+	}
+	// The injected delete leaves the access row physically present, but
+	// terminal family authority is checked on every read, so it cannot be used.
+	if _, err := store.GetAccessTokenSession(ctx, "terminal-cleanup-access", &oauth2.Session{}); !errors.Is(err, fosite.ErrInactiveToken) {
+		t.Fatalf("orphan access error=%v, want ErrInactiveToken", err)
+	}
+}
+
+func TestRefreshFamily_TombstoneCoversLongAccessAndSurvivesCleanupFailure(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+	seedTestClient(t, app)
+	store := oauth2.NewOAuth2Store(app)
+	ctx := context.Background()
+	now := time.Now()
+	accessExpiry := now.Add(72 * time.Hour)
+	refreshExpiry := now.Add(time.Hour)
+	session := makeRefreshSession("long-access-short-refresh")
+	session.SetExpiresAt(fosite.AccessToken, accessExpiry)
+	session.SetExpiresAt(fosite.RefreshToken, refreshExpiry)
+	requestID := "long-access-short-refresh-request"
+	req := &fosite.Request{ID: requestID, Client: &fosite.DefaultClient{ID: testClientID}, RequestedAt: now, Session: session}
+	if err := store.CreateAccessTokenSession(ctx, "long-access-token", req); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRefreshTokenSession(ctx, "short-refresh-token", "long-access-token", req); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("injected long access cleanup failure")
+	app.OnRecordDelete(consts.AccessCollectionName).BindFunc(func(e *core.RecordEvent) error {
+		if e.Record.GetString("signature") == "long-access-token" {
+			return sentinel
+		}
+		return e.Next()
+	})
+	if err := store.RevokeRefreshToken(ctx, requestID); !errors.Is(err, sentinel) {
+		t.Fatalf("revoke error=%v, want wrapped %q", err, sentinel)
+	}
+	tombstone, err := app.FindFirstRecordByFilter(
+		consts.RefreshTombstoneCollectionName,
+		"provider_prefix = {:prefix} && request_id = {:request}",
+		dbx.Params{"prefix": oauth2.DefaultPathPrefix, "request": requestID},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := int64(tombstone.GetInt("expires_at")); got < accessExpiry.Unix() {
+		t.Fatalf("tombstone expiry=%d, want at least long access expiry=%d", got, accessExpiry.Unix())
+	}
+
+	// Simulate an under-budget marker left by an older build. Cleanup must
+	// repair, not delete, it while the failed access cleanup leaves a row that
+	// could otherwise authorize beyond the short refresh lifetime.
+	tombstone.Set("expires_at", now.Add(-time.Hour).Unix())
+	if err := app.Save(tombstone); err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range app.Cron().Jobs() {
+		if job.Id() == consts.CleanupExpiredSessionsJobName {
+			job.Run()
+		}
+	}
+	tombstone, err = app.FindFirstRecordByFilter(
+		consts.RefreshTombstoneCollectionName,
+		"provider_prefix = {:prefix} && request_id = {:request}",
+		dbx.Params{"prefix": oauth2.DefaultPathPrefix, "request": requestID},
+	)
+	if err != nil {
+		t.Fatalf("cleanup removed live-artifact tombstone: %v", err)
+	}
+	if got := int64(tombstone.GetInt("expires_at")); got < accessExpiry.Unix() {
+		t.Fatalf("cleanup repaired expiry=%d, want at least %d", got, accessExpiry.Unix())
+	}
+	if _, err := store.GetAccessTokenSession(ctx, "long-access-token", &oauth2.Session{}); !errors.Is(err, fosite.ErrInactiveToken) {
+		t.Fatalf("surviving long access error=%v, want ErrInactiveToken", err)
+	}
+}
+
+func TestRefreshFamily_ExistingRequestIDCannotCreateSecondRoot(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+	seedTestClient(t, app)
+	store := oauth2.NewOAuth2Store(app)
+	ctx := context.Background()
+	req := &fosite.Request{ID: "duplicate-root-request", Client: &fosite.DefaultClient{ID: testClientID}, Session: makeRefreshSession("duplicate-root")}
+	if err := store.CreateRefreshTokenSession(ctx, "duplicate-root-first", "", req); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateAccessTokenSession(ctx, "duplicate-root-access", req); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRefreshTokenSession(ctx, "duplicate-root-second", "duplicate-root-access", req); !errors.Is(err, fosite.ErrSerializationFailure) {
+		t.Fatalf("second root error=%v, want ErrSerializationFailure", err)
+	}
+	rows, err := app.FindAllRecords(consts.RefreshCollectionName, dbx.HashExp{"request_id": "duplicate-root-request"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].GetString("signature") != "duplicate-root-first" || rows[0].GetString("status") != oauth2.RefreshStatusActive {
+		t.Fatalf("request-id authority changed: %#v", rows)
+	}
+	if _, err := store.GetAccessTokenSession(ctx, "duplicate-root-access", &oauth2.Session{}); !errors.Is(err, fosite.ErrNotFound) {
+		t.Fatalf("rejected second-root access error=%v, want ErrNotFound", err)
+	}
+}
+
+func TestRefreshFamily_CASLoserInvalidationFailuresRollbackAndPropagate(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		failDelete bool
+	}{
+		{name: "save"}, {name: "delete", failDelete: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := setupTestApp(t)
+			defer app.Cleanup()
+			seedTestClient(t, app)
+			store := oauth2.NewOAuth2Store(app)
+			ctx := context.Background()
+			session := makeRefreshSession("cas-fault-" + tc.name)
+			requestID := "cas-fault-request-" + tc.name
+			req := &fosite.Request{ID: requestID, Client: &fosite.DefaultClient{ID: testClientID}, Session: session}
+			rootAccess := "cas-fault-root-access-" + tc.name
+			rootRefresh := "cas-fault-refresh-" + tc.name
+			candidateAccess := "cas-fault-access-" + tc.name
+			candidateRefresh := "cas-fault-child-" + tc.name
+			if err := store.CreateAccessTokenSession(ctx, rootAccess, req); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateRefreshTokenSession(ctx, rootRefresh, rootAccess, req); err != nil {
+				t.Fatal(err)
+			}
+
+			// Pause the winning Fosite flow after Rotate + CreateAccess but before
+			// CreateRefresh. The replay below loses Rotate's CAS while cleanup is
+			// faulted, then the winner resumes against the durable tombstone.
+			winnerReady := make(chan error, 1)
+			resumeWinner := make(chan struct{})
+			winnerDone := make(chan error, 1)
+			go func() {
+				if err := store.RotateRefreshToken(ctx, requestID, rootRefresh); err != nil {
+					winnerReady <- err
+					return
+				}
+				if err := store.CreateAccessTokenSession(ctx, candidateAccess, req); err != nil {
+					winnerReady <- err
+					return
+				}
+				winnerReady <- nil
+				<-resumeWinner
+				winnerDone <- store.CreateRefreshTokenSession(ctx, candidateRefresh, candidateAccess, req)
+			}()
+			if err := <-winnerReady; err != nil {
+				t.Fatalf("winner did not reach Rotate/Create gap: %v", err)
+			}
+
+			sentinel := errors.New("injected CAS loser " + tc.name + " failure")
+			if tc.failDelete {
+				app.OnRecordDelete(consts.AccessCollectionName).BindFunc(func(e *core.RecordEvent) error {
+					if e.Record.GetString("signature") == candidateAccess {
+						return sentinel
+					}
+					return e.Next()
+				})
+			} else {
+				app.OnRecordUpdate(consts.RefreshCollectionName).BindFunc(func(e *core.RecordEvent) error {
+					if e.Record.GetString("status") == oauth2.RefreshStatusReused {
+						return sentinel
+					}
+					return e.Next()
+				})
+			}
+			loserErr := store.RotateRefreshToken(ctx, requestID, rootRefresh)
+			close(resumeWinner)
+			winnerErr := <-winnerDone
+			if !errors.Is(loserErr, sentinel) {
+				t.Fatalf("CAS loser error=%v, want wrapped %q", loserErr, sentinel)
+			}
+			if tc.failDelete {
+				if !errors.Is(winnerErr, sentinel) {
+					t.Fatalf("resumed winner error=%v, want wrapped %q", winnerErr, sentinel)
+				}
+			} else if !errors.Is(winnerErr, fosite.ErrInactiveToken) {
+				t.Fatalf("resumed winner error=%v, want ErrInactiveToken", winnerErr)
+			}
+
+			row := loadRefreshRow(t, app, rootRefresh)
+			if got := row.GetString("status"); got != oauth2.RefreshStatusRotated {
+				t.Fatalf("failed invalidation partially changed status=%q", got)
+			}
+			if _, err := app.FindFirstRecordByFilter(consts.RefreshCollectionName, "signature = {:sig}", dbx.Params{"sig": candidateRefresh}); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("resumed winner minted a refresh child or lookup failed: %v", err)
+			}
+			if _, err := store.GetAccessTokenSession(ctx, candidateAccess, &oauth2.Session{}); !errors.Is(err, fosite.ErrInactiveToken) && !errors.Is(err, fosite.ErrNotFound) {
+				t.Fatalf("resumed winner access remains usable: %v", err)
+			}
+			if _, err := app.FindFirstRecordByFilter(
+				consts.RefreshTombstoneCollectionName,
+				"provider_prefix = {:prefix} && request_id = {:request}",
+				dbx.Params{"prefix": oauth2.DefaultPathPrefix, "request": requestID},
+			); err != nil {
+				t.Fatalf("durable terminal authority missing after cleanup rollback: %v", err)
+			}
+		})
+	}
+}
+
+// TestRefreshFamily_ConcurrentRotation_AtMostOneWinner verifies that one
+// caller may drive active→rotated, while every CAS loser treats the already
+// rotated token as reuse and tombstones the family. No loser may continue to
+// mint a sibling and the winner's not-yet-created child is subsequently
+// refused by CreateRefreshTokenSession.
 func TestRefreshFamily_ConcurrentRotation_AtMostOneWinner(t *testing.T) {
 	app := setupTestApp(t)
 	defer app.Cleanup()
@@ -326,9 +847,9 @@ func TestRefreshFamily_ConcurrentRotation_AtMostOneWinner(t *testing.T) {
 
 	const workers = 8
 	var (
-		wg        sync.WaitGroup
-		start     = make(chan struct{})
-		results   = make([]error, workers)
+		wg      sync.WaitGroup
+		start   = make(chan struct{})
+		results = make([]error, workers)
 	)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -342,37 +863,54 @@ func TestRefreshFamily_ConcurrentRotation_AtMostOneWinner(t *testing.T) {
 	wg.Wait()
 
 	winners := 0
-	losers := 0
+	reuseLosers := 0
 	otherErrs := []error{}
 	for _, err := range results {
 		switch {
 		case err == nil:
 			winners++
-		case errors.Is(err, fosite.ErrSerializationFailure):
-			losers++
+		case errors.Is(err, fosite.ErrInactiveToken):
+			reuseLosers++
 		default:
 			otherErrs = append(otherErrs, err)
 		}
 	}
 	if winners != 1 {
-		t.Errorf("expected exactly 1 winner, got %d (losers=%d, other=%v)",
-			winners, losers, otherErrs)
+		t.Errorf("expected exactly 1 winner, got %d (reuse losers=%d, other=%v)",
+			winners, reuseLosers, otherErrs)
 	}
-	if losers != workers-1 {
-		t.Errorf("expected %d losers with ErrSerializationFailure, got %d (winners=%d, other=%v)",
-			workers-1, losers, winners, otherErrs)
+	if reuseLosers != workers-1 {
+		t.Errorf("expected %d losers with ErrInactiveToken, got %d (winners=%d, other=%v)",
+			workers-1, reuseLosers, winners, otherErrs)
 	}
 	if len(otherErrs) > 0 {
 		t.Errorf("unexpected error(s) from rotation: %v", otherErrs)
 	}
 
-	// Final state: row is rotated exactly once.
+	// Final state: one loser durably converted the family into a reuse
+	// tombstone, so even the winner cannot later create an active child.
 	row := loadRefreshRow(t, app, "race-refresh-0")
-	if got := row.GetString("status"); got != "rotated" {
-		t.Errorf("final status = %q, want rotated", got)
+	if got := row.GetString("status"); got != oauth2.RefreshStatusReused {
+		t.Errorf("final status = %q, want reused", got)
 	}
 	if row.GetInt("rotated_at") == 0 {
 		t.Errorf("rotated_at must be stamped on winner")
 	}
+	replacement := &fosite.Request{ID: "race-req-root", Client: &fosite.DefaultClient{ID: testClientID}, Session: session}
+	if err := store.CreateAccessTokenSession(ctx, "race-access-late", replacement); !errors.Is(err, fosite.ErrInactiveToken) {
+		t.Fatalf("late winner access error=%v, want ErrInactiveToken", err)
+	}
+	if err := store.CreateRefreshTokenSession(ctx, "race-refresh-late", "race-access-late", replacement); !errors.Is(err, fosite.ErrInactiveToken) {
+		t.Fatalf("late winner create error=%v, want ErrInactiveToken", err)
+	}
+	if _, err := app.FindFirstRecordByFilter(
+		consts.RefreshCollectionName,
+		"signature = {:sig}",
+		dbx.Params{"sig": "race-refresh-late"},
+	); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("late active child exists or lookup failed: %v", err)
+	}
+	if _, err := store.GetAccessTokenSession(ctx, "race-access-late", &oauth2.Session{}); !errors.Is(err, fosite.ErrNotFound) {
+		t.Fatalf("late replacement access error=%v, want ErrNotFound", err)
+	}
 }
-

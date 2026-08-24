@@ -1,6 +1,7 @@
 package oauth2
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ func TestRegister_CreatesCollections(t *testing.T) {
 		consts.AuthCodeCollectionName,
 		consts.AccessCollectionName,
 		consts.RefreshCollectionName,
+		consts.RefreshTombstoneCollectionName,
 		consts.PKCECollectionName,
 		consts.OpenIDConnectCollectionName,
 		consts.JTICollectionName,
@@ -249,6 +251,21 @@ func TestCleanupExpiredSessions(t *testing.T) {
 		t.Fatalf("failed to insert expired JTI: %v", err)
 	}
 
+	// Terminal refresh-family authority has its own provider-scoped expiry
+	// collection and must participate in the same bounded-retention cleanup.
+	tombstoneC, err := app.FindCollectionByNameOrId(consts.RefreshTombstoneCollectionName)
+	if err != nil {
+		t.Fatalf("failed to find refresh tombstone collection: %v", err)
+	}
+	tombstone := core.NewRecord(tombstoneC)
+	tombstone.Set("provider_prefix", oauth2.DefaultPathPrefix)
+	tombstone.Set("request_id", "expired-terminal-request")
+	tombstone.Set("family_id", "expired-terminal-family")
+	tombstone.Set("expires_at", expiredTime)
+	if err := app.Save(tombstone); err != nil {
+		t.Fatalf("failed to insert expired refresh tombstone: %v", err)
+	}
+
 	// Run the cleanup job directly
 	var foundJob bool
 	for _, j := range app.Cron().Jobs() {
@@ -288,5 +305,78 @@ func TestCleanupExpiredSessions(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("expected 0 expired JTI records, got %d", n)
+	}
+
+	n, err = app.CountRecords(consts.RefreshTombstoneCollectionName, dbx.HashExp{"request_id": "expired-terminal-request"})
+	if err != nil {
+		t.Fatalf("failed to count refresh tombstones: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 expired refresh tombstones, got %d", n)
+	}
+}
+
+func TestRefreshTombstoneMigration_DownUpPreservesAuthority(t *testing.T) {
+	app := setupTestApp(t)
+	defer app.Cleanup()
+
+	collection, err := app.FindCollectionByNameOrId(consts.RefreshTombstoneCollectionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := core.NewRecord(collection)
+	record.Set("provider_prefix", oauth2.DefaultPathPrefix)
+	record.Set("request_id", "migration-preserved-request")
+	record.Set("family_id", "migration-preserved-family")
+	record.Set("expires_at", time.Now().Add(24*time.Hour).Unix())
+	if err := app.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	var migrationList core.MigrationsList
+	found := false
+	for _, migration := range core.SystemMigrations.Items() {
+		if migration.File == "1770369000_refresh_tombstones.go" {
+			migrationList.Add(migration)
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("refresh tombstone migration is not registered")
+	}
+	runner := core.NewMigrationsRunner(app, migrationList)
+	reverted, err := runner.Down(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reverted) != 1 || reverted[0] != "1770369000_refresh_tombstones.go" {
+		t.Fatalf("reverted migrations=%v", reverted)
+	}
+	if _, err := app.FindRecordById(consts.RefreshTombstoneCollectionName, record.Id); err != nil {
+		t.Fatalf("down migration destroyed terminal authority: %v", err)
+	}
+	applied, err := runner.Up()
+	if err != nil {
+		t.Fatalf("idempotent up migration failed: %v", err)
+	}
+	if len(applied) != 1 || applied[0] != "1770369000_refresh_tombstones.go" {
+		t.Fatalf("applied migrations=%v", applied)
+	}
+	preserved, err := app.FindRecordById(consts.RefreshTombstoneCollectionName, record.Id)
+	if err != nil || preserved.GetString("family_id") != "migration-preserved-family" {
+		t.Fatalf("terminal authority not preserved: record=%v err=%v", preserved, err)
+	}
+	collection, err = app.FindCollectionByNameOrId(consts.RefreshTombstoneCollectionName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"provider_prefix", "request_id", "family_id", "expires_at"} {
+		if collection.Fields.GetByName(name) == nil {
+			t.Errorf("field %q missing after down/up", name)
+		}
+	}
+	if index := collection.GetIndex("idx_oauth2_refresh_tombstone_request"); !strings.Contains(strings.ToUpper(index), "UNIQUE") {
+		t.Fatalf("provider/request unique index missing after down/up: %q", index)
 	}
 }

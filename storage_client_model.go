@@ -1,12 +1,12 @@
 package oauth2
 
 import (
+	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/jesposito/pocketbase-ext-oauth2-mt/client"
 	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
-	"github.com/google/uuid"
-	"fmt"
 	"github.com/pocketbase/pocketbase/core"
 )
 
@@ -25,6 +25,11 @@ func NewClientModel(app core.App) *ClientModel {
 }
 
 func NewClientFromRFC7591Metadata(app core.App, md *RFC7591ClientMetadataRequest) (*client.Client, string, error) {
+	return NewClientFromRFC7591MetadataAt(app, DefaultPathPrefix, md)
+}
+
+func NewClientFromRFC7591MetadataAt(app core.App, prefix string, md *RFC7591ClientMetadataRequest) (*client.Client, string, error) {
+	prefix = normalizePrefix(prefix)
 	m := NewClientModel(app)
 
 	clientID := uuid.New().String()
@@ -44,7 +49,7 @@ func NewClientFromRFC7591Metadata(app core.App, md *RFC7591ClientMetadataRequest
 		// this list are service specific.  If omitted, an authorization
 		// server MAY register a client with a default set of scopes.
 		// @ref https://datatracker.ietf.org/doc/html/rfc7591#section-2
-		inst := mustGetInstance(app)
+		inst := mustGetInstanceAt(app, prefix)
 		inst.mu.RLock()
 		md.Scope = strings.Join(inst.metadata.ScopesSupported, " ")
 		inst.mu.RUnlock()
@@ -59,6 +64,7 @@ func NewClientFromRFC7591Metadata(app core.App, md *RFC7591ClientMetadataRequest
 	}
 
 	m.Set("client_id", clientID)
+	m.Set("provider_prefix", prefix)
 	m.Set("client_name", md.ClientName)
 	m.Set("client_secret", clientSecret) // N.b. This will be hashed in the OnModelCreate hook before saving to the database.
 	m.Set("client_secret_expires_at", 0)
@@ -71,7 +77,7 @@ func NewClientFromRFC7591Metadata(app core.App, md *RFC7591ClientMetadataRequest
 	// explicitly when calling RegisterClient. Empty audience used to
 	// mean "any audience accepted" downstream, which is wrong - this
 	// gives audience validation a real value to check against.
-	m.Set("audience", []string{app.Settings().Meta.AppURL})
+	m.Set("audience", []string{providerIssuer(app, mustGetInstanceAt(app, prefix).cfg)})
 	m.Set("owner", "")
 	m.Set("policy_uri", md.PolicyURI)
 	m.Set("tos_uri", md.TermsOfServiceURI)
