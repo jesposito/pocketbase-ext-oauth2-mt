@@ -3,6 +3,7 @@ package oauth2
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -14,7 +15,6 @@ import (
 	"github.com/go-jose/go-jose/v3"
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/compose"
-	"errors"
 
 	"github.com/jesposito/pocketbase-ext-oauth2-mt/consts"
 	_ "github.com/jesposito/pocketbase-ext-oauth2-mt/migrations"
@@ -24,6 +24,7 @@ import (
 	"github.com/jesposito/pocketbase-ext-oauth2-mt/ui"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/hook"
 	"github.com/pocketbase/pocketbase/tools/router"
 )
 
@@ -231,8 +232,8 @@ func Register(app core.App, config *Config) error {
 	// Pre-normalize the prefix BEFORE the guard claim so the key matches
 	// what Register's later store-key derivation will use.
 	prefix := DefaultPathPrefix
-	if config != nil && strings.TrimSpace(config.PathPrefix) != "" {
-		prefix = strings.TrimSpace(config.PathPrefix)
+	if config != nil {
+		prefix = normalizePrefix(config.PathPrefix)
 	}
 	key := guardKey{app: app, prefix: prefix}
 
@@ -254,9 +255,7 @@ func Register(app core.App, config *Config) error {
 	config = cloneConfig(config)
 
 	// Normalize defaults
-	if config.PathPrefix == "" {
-		config.PathPrefix = DefaultPathPrefix
-	}
+	config.PathPrefix = prefix
 	if config.UserInfoClaimStrategy == nil {
 		config.UserInfoClaimStrategy = &DefaultUserInfoClaimStrategy{}
 	}
@@ -290,24 +289,28 @@ func Register(app core.App, config *Config) error {
 	// Track which prefixes have been registered on this app so
 	// Deregister can clean them all up without external bookkeeping.
 	rememberRegisteredPrefix(app, prefix)
+	registerClientSecretHashHook(app)
 
 	// Attach bootstrap handler
 	loadParams := func(app core.App) (err error) {
-		inst.privateKey, err = loadPrivateKeyFromAppStorage(app)
+		if err := validateProviderPrefixState(app); err != nil {
+			return fmt.Errorf("Plugin/OAuth2: provider-prefix validation failed: %w", err)
+		}
+		inst.privateKey, err = loadPrivateKeyFromAppStorageAt(app, prefix)
 		if err != nil {
 			return fmt.Errorf("Plugin/OAuth2: Failed to load or generate private key: %w", err)
 		}
-		inst.cfg.GlobalSecret, err = loadGlobalSecretFromAppStorage(app)
+		inst.cfg.GlobalSecret, err = loadGlobalSecretFromAppStorageAt(app, prefix)
 		if err != nil {
 			return fmt.Errorf("Plugin/OAuth2: Failed to load or generate global secret: %w", err)
 		}
 
-		inst.store = NewOAuth2Store(app)
+		inst.store = NewOAuth2StoreAt(app, prefix)
 		inst.provider = compose.Compose(
 			inst.cfg.BaseConfig,
 			inst.store,
 			compose.CommonStrategy{
-				CoreStrategy: NewPocketBaseStrategy(app, inst.cfg),
+				CoreStrategy: NewPocketBaseStrategyAt(app, inst.cfg, prefix),
 				OpenIDConnectTokenStrategy: compose.NewOpenIDConnectStrategy(
 					func(ctx context.Context) (any, error) {
 						if inst.privateKey == nil {
@@ -343,6 +346,7 @@ func Register(app core.App, config *Config) error {
 
 	if app.IsBootstrapped() {
 		if err := loadParams(app); err != nil {
+			DeregisterAt(app, prefix)
 			return err
 		}
 	} else {
@@ -363,7 +367,7 @@ func Register(app core.App, config *Config) error {
 			&rfc9728.ProtectedResourceMetadata{
 				Resource: app.Settings().Meta.AppURL + config.PathPrefix + "/userinfo",
 				AuthorizationServers: []string{
-					app.Settings().Meta.AppURL,
+					providerIssuer(app, config),
 				},
 				BearerMethodsSupported: []string{"header"},
 				ScopesSupported:        []string{"openid", "profile", "email"},
@@ -371,10 +375,32 @@ func Register(app core.App, config *Config) error {
 		)
 		return se.Next()
 	})
+	registerCleanupJob(app)
 
-	// Attach event listeners
-	app.OnRecordCreate(consts.ClientCollectionName).
-		BindFunc(func(e *core.RecordEvent) error {
+	return nil
+}
+
+const clientSecretHashHookID = "pocketbase-ext-oauth2-mt/client-secret-hash"
+
+// registerClientSecretHashHook binds one prefix-aware hook per app. Binding
+// the stable id again replaces the handler instead of stacking another hash
+// pass when a second provider is registered.
+func registerClientSecretHashHook(app core.App) {
+	app.OnRecordCreate(consts.ClientCollectionName).Bind(&hook.Handler[*core.RecordEvent]{
+		Id: clientSecretHashHookID,
+		Func: func(e *core.RecordEvent) error {
+			prefix := normalizePrefix(e.Record.GetString("provider_prefix"))
+			if e.Record.GetString("provider_prefix") == "" {
+				if !legacyDefaultAllowed(app, DefaultPathPrefix) {
+					return errors.New("[Plugin/OAuth2] provider_prefix is required for client creation when multiple providers are registered")
+				}
+				prefix = DefaultPathPrefix
+				e.Record.Set("provider_prefix", prefix)
+			}
+			inst, ok := getInstanceAt(app, prefix)
+			if !ok || inst.cfg == nil {
+				return fmt.Errorf("[Plugin/OAuth2] client provider_prefix %q is not registered", prefix)
+			}
 			e.App.Logger().Info(
 				"[Plugin/OAuth2] New client registered",
 				slog.Any("client_id", e.Record.GetString("client_id")),
@@ -396,7 +422,11 @@ func Register(app core.App, config *Config) error {
 			}
 			e.Record.Set("client_secret", string(h))
 			return e.Next()
-		})
+		},
+	})
+}
+
+func registerCleanupJob(app core.App) {
 
 	// Attach cron jobs
 	app.Cron().MustAdd(consts.CleanupExpiredSessionsJobName, "0 * * * *", func() {
@@ -432,9 +462,60 @@ func Register(app core.App, config *Config) error {
 				}
 			}
 		}
+		cleanupExpiredRefreshTombstones(app)
 	})
+}
 
-	return nil
+func cleanupExpiredRefreshTombstones(app core.App) {
+	now := time.Now().Unix()
+	records, err := app.FindAllRecords(
+		consts.RefreshTombstoneCollectionName,
+		dbx.NewExp("expires_at < {:now}", dbx.Params{"now": now}),
+	)
+	if err != nil {
+		app.Logger().Error(
+			"[Plugin/OAuth2] Failed to query expired refresh tombstones",
+			slog.Any("error", err),
+		)
+		return
+	}
+	for _, stale := range records {
+		err := app.RunInTransaction(func(txApp core.App) error {
+			current, err := txApp.FindRecordById(consts.RefreshTombstoneCollectionName, stale.Id)
+			if err != nil {
+				return err
+			}
+			if int64(current.GetInt("expires_at")) >= now {
+				return nil
+			}
+			_, artifactExpiry, artifactCount, err := scopedRefreshArtifactAuthority(
+				txApp,
+				current.GetString("provider_prefix"),
+				current.GetString("request_id"),
+			)
+			if err != nil {
+				return err
+			}
+			if artifactCount > 0 {
+				retryExpiry := time.Now().Add(missingRefreshTombstoneLifetime).Unix()
+				if artifactExpiry > retryExpiry {
+					retryExpiry = artifactExpiry
+				}
+				current.Set("expires_at", retryExpiry)
+				return txApp.Save(current)
+			}
+			return txApp.Delete(current)
+		})
+		if err != nil {
+			// Fail closed: leave the tombstone physically present on every query,
+			// extension, save, or delete failure and retry during the next run.
+			app.Logger().Error(
+				"[Plugin/OAuth2] Failed to safely clean expired refresh tombstone",
+				slog.Any("record_id", stale.Id),
+				slog.Any("error", err),
+			)
+		}
+	}
 }
 
 //
@@ -442,9 +523,14 @@ func Register(app core.App, config *Config) error {
 // buildProviderMetadata constructs the OIDC/OAuth2 discovery metadata.
 // Aligned with OAuth 2.1: implicit grant and hybrid flows are removed.
 func buildProviderMetadata(app core.App, cfg *Config) *openid.OpenIDProviderMetadata {
+	issuer := providerIssuer(app, cfg)
+	jwksURI := app.Settings().Meta.AppURL + "/.well-known/jwks.json"
+	if normalizePrefix(cfg.PathPrefix) != DefaultPathPrefix {
+		jwksURI = issuer + "/jwks.json"
+	}
 	return &openid.OpenIDProviderMetadata{
 		AuthorizationServerMetadata: rfc8414.AuthorizationServerMetadata{
-			Issuer:                app.Settings().Meta.AppURL,
+			Issuer:                issuer,
 			RegistrationEndpoint:  app.Settings().Meta.AppURL + cfg.PathPrefix + "/register",
 			AuthzEndpoint:         app.Settings().Meta.AppURL + cfg.PathPrefix + "/auth",
 			TokenEndpoint:         app.Settings().Meta.AppURL + cfg.PathPrefix + "/token",
@@ -455,7 +541,7 @@ func buildProviderMetadata(app core.App, cfg *Config) *openid.OpenIDProviderMeta
 			RevocationEndpointAuthMethodsSupported:    []string{"client_secret_basic", "client_secret_post"},
 			IntrospectionEndpointAuthMethodsSupported: []string{"client_secret_basic", "client_secret_post"},
 
-			JwksURI: app.Settings().Meta.AppURL + "/.well-known/jwks.json",
+			JwksURI: jwksURI,
 
 			ScopesSupported: []string{
 				"openid",
@@ -548,6 +634,14 @@ func buildProviderMetadata(app core.App, cfg *Config) *openid.OpenIDProviderMeta
 		RequestURIParameterSupported:  true,
 		RequireRequestURIRegistration: true,
 	}
+}
+
+func providerIssuer(app core.App, cfg *Config) string {
+	base := strings.TrimRight(app.Settings().Meta.AppURL, "/")
+	if normalizePrefix(cfg.PathPrefix) == DefaultPathPrefix {
+		return base
+	}
+	return base + normalizePrefix(cfg.PathPrefix)
 }
 
 //
@@ -686,16 +780,20 @@ func bindOAuth2Handlers(inst *Instance, r *router.Router[*core.RequestEvent]) {
 }
 
 func bindOAuth2WellKnownHandlers(inst *Instance, r *router.Router[*core.RequestEvent]) {
+	basePath := ""
+	if normalizePrefix(inst.cfg.PathPrefix) != DefaultPathPrefix {
+		basePath = normalizePrefix(inst.cfg.PathPrefix)
+	}
 	// rfc8414
 	// Authorization Server Metadata
 	// @ref https://datatracker.ietf.org/doc/html/rfc8414
 	// @ref https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderMetadata
-	handleJSON(r, "/.well-known/oauth-authorization-server", func(_ *core.RequestEvent) (any, error) {
+	handleJSON(r, basePath+"/.well-known/oauth-authorization-server", func(_ *core.RequestEvent) (any, error) {
 		inst.mu.RLock()
 		defer inst.mu.RUnlock()
 		return inst.metadata.AuthorizationServerMetadata, nil
 	})
-	handleJSON(r, "/.well-known/openid-configuration", func(_ *core.RequestEvent) (any, error) {
+	handleJSON(r, basePath+"/.well-known/openid-configuration", func(_ *core.RequestEvent) (any, error) {
 		inst.mu.RLock()
 		defer inst.mu.RUnlock()
 		return inst.metadata, nil
@@ -707,7 +805,11 @@ func bindOAuth2WellKnownHandlers(inst *Instance, r *router.Router[*core.RequestE
 	rfc7517KeySet := &jose.JSONWebKeySet{
 		Keys: []jose.JSONWebKey{inst.privateKey.Public()},
 	}
-	handleJSON(r, "/.well-known/jwks.json", func(_ *core.RequestEvent) (any, error) {
+	jwksPath := "/.well-known/jwks.json"
+	if basePath != "" {
+		jwksPath = basePath + "/jwks.json"
+	}
+	handleJSON(r, jwksPath, func(_ *core.RequestEvent) (any, error) {
 		return rfc7517KeySet, nil
 	})
 
@@ -715,7 +817,7 @@ func bindOAuth2WellKnownHandlers(inst *Instance, r *router.Router[*core.RequestE
 	// Protected Resource Metadata
 	// @ref https://datatracker.ietf.org/doc/html/rfc9728
 	if inst.cfg.EnableRFC9728ProtectedResourceMetadata {
-		handleJSON(r, "/.well-known/oauth-protected-resource/{resource}", func(e *core.RequestEvent) (any, error) {
+		handleJSON(r, basePath+"/.well-known/oauth-protected-resource/{resource}", func(e *core.RequestEvent) (any, error) {
 			inst.mu.RLock()
 			defer inst.mu.RUnlock()
 

@@ -20,12 +20,17 @@ import (
 //
 
 type OAuth2Store struct {
-	app core.App
+	app    core.App
+	prefix string
 }
 
 func NewOAuth2Store(app core.App) *OAuth2Store {
+	return NewOAuth2StoreAt(app, DefaultPathPrefix)
+}
+
+func NewOAuth2StoreAt(app core.App, prefix string) *OAuth2Store {
 	return &OAuth2Store{
-		app: app,
+		app: app, prefix: normalizePrefix(prefix),
 	}
 }
 
@@ -40,6 +45,7 @@ func (s *OAuth2Store) GetClient(ctx context.Context, id string) (fosite.Client, 
 	}
 	err = s.app.RecordQuery(c).
 		AndWhere(dbx.HashExp{"client_id": id}).
+		AndWhere(providerPrefixExp(s.app, s.prefix)).
 		One(m)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -52,31 +58,34 @@ func (s *OAuth2Store) GetClient(ctx context.Context, id string) (fosite.Client, 
 
 // RegisterClient implements [RFC7591ClientStorage].
 func (s *OAuth2Store) RegisterClient(ctx context.Context, client *RFC7591ClientMetadataRequest) (fosite.Client, string, error) {
-	return NewClientFromRFC7591Metadata(s.app, client)
+	return NewClientFromRFC7591MetadataAt(s.app, s.prefix, client)
 }
 
 // ClientAssertionJWTValid implements [fosite.ClientManager].
 func (s *OAuth2Store) ClientAssertionJWTValid(ctx context.Context, jti string) error {
-	return hasJTIModel(s.app, jti)
+	return hasJTIModel(s.app, s.prefix, jti)
 }
 
 // SetClientAssertionJWT implements [fosite.ClientManager].
 func (s *OAuth2Store) SetClientAssertionJWT(ctx context.Context, jti string, exp time.Time) error {
-	return newJTIModel(s.app, jti, exp)
+	return newJTIModel(s.app, s.prefix, jti, exp)
 }
 
 // CreateAuthorizeCodeSession implements [oauth2.AuthorizeCodeStorage].
 func (s *OAuth2Store) CreateAuthorizeCodeSession(ctx context.Context, code string, request fosite.Requester) (err error) {
 	m := newSessionModel(s.app, &AuthCodeModel{})
+	m.Set("provider_prefix", s.prefix)
 	m.SetSignature(code)
-	m.SetRequester(request, fosite.AuthorizeCode)
+	if err := m.SetRequester(request, fosite.AuthorizeCode); err != nil {
+		return err
+	}
 
 	return s.app.Save(m)
 }
 
 // GetAuthorizeCodeSession implements [oauth2.AuthorizeCodeStorage].
 func (s *OAuth2Store) GetAuthorizeCodeSession(ctx context.Context, code string, session fosite.Session) (request fosite.Requester, err error) {
-	m, err := findSessionModelBySignature(s.app, &AuthCodeModel{}, code)
+	m, err := findSessionModelBySignature(s.app, s.prefix, &AuthCodeModel{}, code)
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +95,7 @@ func (s *OAuth2Store) GetAuthorizeCodeSession(ctx context.Context, code string, 
 		return nil, err
 	}
 
-	if err := hasJTIModel(s.app, code); err != nil {
+	if err := hasJTIModel(s.app, s.prefix, code); err != nil {
 		if errors.Is(err, fosite.ErrJTIKnown) {
 			return req, fosite.ErrInvalidatedAuthorizeCode
 		} else {
@@ -99,23 +108,38 @@ func (s *OAuth2Store) GetAuthorizeCodeSession(ctx context.Context, code string, 
 
 // InvalidateAuthorizeCodeSession implements [oauth2.AuthorizeCodeStorage].
 func (s *OAuth2Store) InvalidateAuthorizeCodeSession(ctx context.Context, code string) (err error) {
-	m, err := findSessionModelBySignature(s.app, &AuthCodeModel{}, code)
+	m, err := findSessionModelBySignature(s.app, s.prefix, &AuthCodeModel{}, code)
 	if err != nil {
 		if errors.Is(err, fosite.ErrNotFound) {
 			return nil // if the session is not found, we can consider it already deleted and return no error
 		}
+		return err
 	}
-
-	return newJTIModel(s.app, code, *m.GetExpiresAt())
+	expiresAt := m.GetExpiresAt()
+	if expiresAt == nil {
+		return errors.New("authorization code session has no expiry")
+	}
+	return newJTIModel(s.app, s.prefix, code, *expiresAt)
 }
 
 // CreateAccessTokenSession implements [oauth2.AccessTokenStorage].
 func (s *OAuth2Store) CreateAccessTokenSession(ctx context.Context, signature string, request fosite.Requester) (err error) {
-	m := newSessionModel(s.app, &AccessTokenModel{})
-	m.SetSignature(signature)
-	m.SetRequester(request, fosite.AccessToken)
-
-	return s.app.Save(m)
+	return s.app.RunInTransaction(func(txApp core.App) error {
+		terminal, err := hasRefreshTerminalAuthority(txApp, s.prefix, request.GetID())
+		if err != nil {
+			return fosite.ErrServerError.WithWrap(err).WithDebug("failed to read terminal refresh-family authority before access issuance")
+		}
+		if terminal {
+			return fosite.ErrInactiveToken
+		}
+		m := newSessionModel(txApp, &AccessTokenModel{})
+		m.Set("provider_prefix", s.prefix)
+		m.SetSignature(signature)
+		if err := m.SetRequester(request, fosite.AccessToken); err != nil {
+			return err
+		}
+		return txApp.Save(m)
+	})
 }
 
 // CreateRefreshTokenSession implements [oauth2.RefreshTokenStorage].
@@ -129,20 +153,47 @@ func (s *OAuth2Store) CreateAccessTokenSession(ctx context.Context, signature st
 //     the predecessor's record id.
 //   - status defaults to active.
 func (s *OAuth2Store) CreateRefreshTokenSession(ctx context.Context, signature string, accessSignature string, request fosite.Requester) (err error) {
-	m := newSessionModel(s.app, &RefreshTokenModel{})
-	m.SetSignature(signature)
-	if err := m.SetRequester(request, fosite.RefreshToken); err != nil {
+	var abortErr error
+	err = s.app.RunInTransaction(func(txApp core.App) error {
+		m := newSessionModel(txApp, &RefreshTokenModel{})
+		m.Set("provider_prefix", s.prefix)
+		m.SetSignature(signature)
+		if err := m.SetRequester(request, fosite.RefreshToken); err != nil {
+			return err
+		}
+
+		familyID, parentID, lineageErr := s.resolveRefreshLineage(txApp, request)
+		if lineageErr != nil {
+			// Fosite creates the replacement access row between Rotate and
+			// CreateRefreshTokenSession. If terminal family authority won that
+			// gap, commit removal of the otherwise-orphaned access row before
+			// returning the inactive-token error. A non-terminal duplicate only
+			// owns its exact candidate access signature; do not delete the
+			// legitimate winner's access row.
+			if errors.Is(lineageErr, fosite.ErrInactiveToken) {
+				if cleanupErr := deleteSessionModelsByRequestID(txApp, s.prefix, &AccessTokenModel{}, request.GetID()); cleanupErr != nil {
+					return fosite.ErrServerError.WithWrap(cleanupErr).WithDebug("failed to remove access rows after terminal refresh-family state")
+				}
+			} else if accessSignature != "" {
+				if cleanupErr := deleteSessionModelBySignature(txApp, s.prefix, &AccessTokenModel{}, accessSignature); cleanupErr != nil {
+					return fosite.ErrServerError.WithWrap(cleanupErr).WithDebug("failed to remove rejected refresh replacement access row")
+				}
+			}
+			abortErr = lineageErr
+			return nil
+		}
+		m.SetFamilyID(familyID)
+		m.SetParentRefreshID(parentID)
+		m.SetStatus(RefreshStatusActive)
+		m.SetRotatedAt(0)
+		m.SetReusedAt(0)
+
+		return txApp.Save(m)
+	})
+	if err != nil {
 		return err
 	}
-
-	familyID, parentID := s.resolveRefreshLineage(request)
-	m.SetFamilyID(familyID)
-	m.SetParentRefreshID(parentID)
-	m.SetStatus(RefreshStatusActive)
-	m.SetRotatedAt(0)
-	m.SetReusedAt(0)
-
-	return s.app.Save(m)
+	return abortErr
 }
 
 // resolveRefreshLineage decides the family_id and parent_refresh_id for a
@@ -150,43 +201,115 @@ func (s *OAuth2Store) CreateRefreshTokenSession(ctx context.Context, signature s
 // RotateRefreshToken before CreateRefreshTokenSession and propagates the
 // original request id (see fosite/handler/oauth2/flow_refresh.go), so the
 // predecessor row is the one with the same request_id that we just marked
-// rotated. If no such predecessor exists, this is a new chain root.
-func (s *OAuth2Store) resolveRefreshLineage(request fosite.Requester) (familyID string, parentRefreshID string) {
+// rotated. A root is allowed only when that provider prefix has no row at all
+// for the non-empty request id; terminal and corrupt history fail closed.
+func (s *OAuth2Store) resolveRefreshLineage(app core.App, request fosite.Requester) (familyID string, parentRefreshID string, err error) {
 	requestID := request.GetID()
-	if requestID != "" {
-		c, err := s.app.FindCachedCollectionByNameOrId(consts.RefreshCollectionName)
-		if err == nil {
-			parent := &RefreshTokenModel{}
-			err = s.app.RecordQuery(c).
-				AndWhere(dbx.HashExp{
-					"request_id": requestID,
-					"status":     RefreshStatusRotated,
-				}).
-				OrderBy("rotated_at DESC").
-				Limit(1).
-				One(parent)
-			if err == nil && parent.GetFamilyID() != "" {
-				return parent.GetFamilyID(), parent.GetID()
+	if requestID == "" {
+		return "", "", errors.New("refresh request has no request_id")
+	}
+	terminal, err := hasRefreshTerminalAuthority(app, s.prefix, requestID)
+	if err != nil {
+		return "", "", err
+	}
+	if terminal {
+		return "", "", fosite.ErrInactiveToken
+	}
+	c, err := app.FindCachedCollectionByNameOrId(consts.RefreshCollectionName)
+	if err != nil {
+		return "", "", err
+	}
+	var rows []*RefreshTokenModel
+	err = app.RecordQuery(c).
+		AndWhere(dbx.HashExp{"request_id": requestID}).
+		AndWhere(providerPrefixExp(app, s.prefix)).
+		OrderBy("rotated_at DESC", "id DESC").
+		All(&rows)
+	if err != nil {
+		return "", "", err
+	}
+	if len(rows) == 0 {
+		return uuid.NewString(), "", nil
+	}
+
+	// A request id is a refresh-family authority, not permission to mint
+	// another root. Every row must attest one family and only the most
+	// recently rotated row may parent a replacement. Terminal or corrupt
+	// state wins over every rotated breadcrumb, independent of row order.
+	var parent *RefreshTokenModel
+	terminalRow := false
+	active := false
+	var corruptErr error
+	for _, row := range rows {
+		if row.GetFamilyID() == "" {
+			corruptErr = errors.New("refresh-family row has no family_id")
+		} else if familyID == "" {
+			familyID = row.GetFamilyID()
+		} else if familyID != row.GetFamilyID() {
+			corruptErr = errors.New("request_id spans multiple refresh families")
+		}
+		switch row.GetStatus() {
+		case RefreshStatusReused, RefreshStatusRevoked:
+			terminalRow = true
+		case RefreshStatusRotated:
+			if parent == nil {
+				parent = row
 			}
+		case RefreshStatusActive:
+			active = true
+		default:
+			corruptErr = errors.New("refresh-family row has an invalid status")
 		}
 	}
-	return uuid.NewString(), ""
+	if terminalRow {
+		return "", "", fosite.ErrInactiveToken
+	}
+	if corruptErr != nil {
+		return "", "", corruptErr
+	}
+	if active {
+		return "", "", fosite.ErrSerializationFailure.WithDebug(
+			"request already has an active refresh token")
+	}
+	if parent == nil {
+		return "", "", errors.New("refresh-family request has no rotated predecessor")
+	}
+	return familyID, parent.GetID(), nil
 }
 
 // DeleteAccessTokenSession implements [oauth2.AccessTokenStorage].
 func (s *OAuth2Store) DeleteAccessTokenSession(ctx context.Context, signature string) (err error) {
-	return deleteSessionModelBySignature(s.app, &AccessTokenModel{}, signature)
+	return deleteSessionModelBySignature(s.app, s.prefix, &AccessTokenModel{}, signature)
 }
 
 // DeleteRefreshTokenSession implements [oauth2.RefreshTokenStorage].
 func (s *OAuth2Store) DeleteRefreshTokenSession(ctx context.Context, signature string) (err error) {
-	return deleteSessionModelBySignature(s.app, &RefreshTokenModel{}, signature)
+	m, err := findSessionModelBySignature(s.app, s.prefix, &RefreshTokenModel{}, signature)
+	if err != nil {
+		if errors.Is(err, fosite.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	// Fosite calls DeleteRefreshTokenSession after GetRefreshTokenSession
+	// reports reuse. Physically deleting that terminal row in the winner's
+	// Rotate -> Create gap erases the only family authority and permits the
+	// winner to create a fresh root. Keep terminal rows as tombstones; expiry
+	// cleanup owns their eventual removal. Active rows retain the historical
+	// direct-delete behavior.
+	if m.GetStatus() == RefreshStatusReused || m.GetStatus() == RefreshStatusRevoked {
+		return nil
+	}
+	return s.app.Delete(m.ProxyRecord())
 }
 
 // GetAccessTokenSession implements [oauth2.AccessTokenStorage].
 func (s *OAuth2Store) GetAccessTokenSession(ctx context.Context, signature string, session fosite.Session) (request fosite.Requester, err error) {
-	m, err := findSessionModelBySignature(s.app, &AccessTokenModel{}, signature)
+	m, err := findSessionModelBySignature(s.app, s.prefix, &AccessTokenModel{}, signature)
 	if err != nil {
+		return nil, err
+	}
+	if err := assertRefreshFamilyAllowsAccess(s.app, s.prefix, m.GetRequestID()); err != nil {
 		return nil, err
 	}
 
@@ -202,18 +325,42 @@ func (s *OAuth2Store) GetAccessTokenSession(ctx context.Context, signature strin
 // the upstream refresh-grant handler treats it as reuse per RFC 6819
 // section 5.2.2.3.
 func (s *OAuth2Store) GetRefreshTokenSession(ctx context.Context, signature string, session fosite.Session) (request fosite.Requester, err error) {
-	m, err := findSessionModelBySignature(s.app, &RefreshTokenModel{}, signature)
+	m, err := findSessionModelBySignature(s.app, s.prefix, &RefreshTokenModel{}, signature)
 	if err != nil {
 		return nil, err
 	}
+	terminal, err := hasRefreshTerminalAuthority(s.app, s.prefix, m.GetRequestID())
+	if err != nil {
+		return nil, fosite.ErrServerError.WithWrap(err).WithDebug("failed to read terminal refresh-family authority")
+	}
+	if terminal {
+		req, reqErr := m.ToRequest(ctx, s, session)
+		if reqErr != nil {
+			return nil, fosite.ErrServerError.WithWrap(reqErr).WithDebug("invalid terminal refresh session")
+		}
+		return req, fosite.ErrInactiveToken
+	}
 
 	if m.GetStatus() != RefreshStatusActive {
-		req, _ := m.ToRequest(ctx, s, session)
-		// Best-effort family invalidation. Even if invalidation hits a
-		// transient error we still surface ErrInactiveToken so the
-		// upstream handler aborts the refresh attempt.
+		req, reqErr := m.ToRequest(ctx, s, session)
+		expiresAt := int64(0)
+		if expiry := m.GetExpiresAt(); expiry != nil {
+			expiresAt = expiry.Unix()
+		}
+		if authorityErr := commitRefreshTerminalAuthority(
+			s.app, s.prefix, m.GetRequestID(), m.GetFamilyID(), expiresAt,
+		); authorityErr != nil {
+			return nil, fosite.ErrServerError.WithWrap(authorityErr).WithDebug("failed to commit reused refresh-family authority")
+		}
 		if familyID := m.GetFamilyID(); familyID != "" {
-			_ = invalidateRefreshFamily(s.app, familyID)
+			if ierr := invalidateRefreshFamily(s.app, s.prefix, familyID); ierr != nil {
+				return nil, fosite.ErrServerError.WithWrap(ierr).WithDebug("failed to invalidate reused refresh family")
+			}
+		} else if ierr := invalidateLegacyRefreshRow(s.app, s.prefix, m); ierr != nil {
+			return nil, fosite.ErrServerError.WithWrap(ierr).WithDebug("failed to invalidate legacy reused refresh token")
+		}
+		if reqErr != nil {
+			return nil, fosite.ErrServerError.WithWrap(reqErr).WithDebug("invalid reused refresh session")
 		}
 		return req, fosite.ErrInactiveToken
 	}
@@ -223,7 +370,7 @@ func (s *OAuth2Store) GetRefreshTokenSession(ctx context.Context, signature stri
 
 // RevokeAccessToken implements [oauth2.AccessTokenStorage].
 func (s *OAuth2Store) RevokeAccessToken(ctx context.Context, requestID string) error {
-	return deleteSessionModelByRequestID(s.app, &AccessTokenModel{}, requestID)
+	return deleteSessionModelsByRequestID(s.app, s.prefix, &AccessTokenModel{}, requestID)
 }
 
 // RevokeRefreshToken implements [oauth2.TokenRevocationStorage].
@@ -233,15 +380,10 @@ func (s *OAuth2Store) RevokeAccessToken(ctx context.Context, requestID string) e
 // family breadcrumb. The cleanup cron deletes the row eventually via
 // expires_at.
 func (s *OAuth2Store) RevokeRefreshToken(ctx context.Context, requestID string) error {
-	m, err := findSessionModelByRequestID(s.app, &RefreshTokenModel{}, requestID)
-	if err != nil {
-		if errors.Is(err, fosite.ErrNotFound) {
-			return nil
-		}
+	if err := commitRefreshTerminalAuthority(s.app, s.prefix, requestID, "", 0); err != nil {
 		return err
 	}
-	m.SetStatus(RefreshStatusRevoked)
-	return s.app.Save(m.ProxyRecord())
+	return revokeRefreshFamilyByRequestID(s.app, s.prefix, requestID)
 }
 
 // RotateRefreshToken implements [oauth2.RefreshTokenStorage].
@@ -251,29 +393,37 @@ func (s *OAuth2Store) RevokeRefreshToken(ctx context.Context, requestID string) 
 // token by request_id. The replacement refresh row is created by the
 // upstream handler in a follow-up CreateRefreshTokenSession call.
 func (s *OAuth2Store) RotateRefreshToken(ctx context.Context, requestID string, refreshTokenSignature string) (err error) {
-	if err := markRefreshRotated(s.app, refreshTokenSignature); err != nil {
+	if err := markRefreshRotated(s.app, s.prefix, requestID, refreshTokenSignature); err != nil {
+		if errors.Is(err, fosite.ErrInactiveToken) {
+			if cleanupErr := deleteSessionModelsByRequestID(s.app, s.prefix, &AccessTokenModel{}, requestID); cleanupErr != nil {
+				return fosite.ErrServerError.WithWrap(cleanupErr).WithDebug("failed to remove access rows for inactive refresh rotation")
+			}
+		}
 		return err
 	}
-	return deleteSessionModelByRequestID(s.app, &AccessTokenModel{}, requestID)
+	return deleteSessionModelsByRequestID(s.app, s.prefix, &AccessTokenModel{}, requestID)
 }
 
 // CreatePKCERequestSession implements [pkce.PKCERequestStorage].
 func (s *OAuth2Store) CreatePKCERequestSession(ctx context.Context, signature string, requester fosite.Requester) error {
 	m := newSessionModel(s.app, &PKCEModel{})
+	m.Set("provider_prefix", s.prefix)
 	m.SetSignature(signature)
-	m.SetRequester(requester, "")
+	if err := m.SetRequester(requester, ""); err != nil {
+		return err
+	}
 
 	return s.app.Save(m)
 }
 
 // DeletePKCERequestSession implements [pkce.PKCERequestStorage].
 func (s *OAuth2Store) DeletePKCERequestSession(ctx context.Context, signature string) error {
-	return deleteSessionModelBySignature(s.app, &PKCEModel{}, signature)
+	return deleteSessionModelBySignature(s.app, s.prefix, &PKCEModel{}, signature)
 }
 
 // GetPKCERequestSession implements [pkce.PKCERequestStorage].
 func (s *OAuth2Store) GetPKCERequestSession(ctx context.Context, signature string, session fosite.Session) (fosite.Requester, error) {
-	m, err := findSessionModelBySignature(s.app, &PKCEModel{}, signature)
+	m, err := findSessionModelBySignature(s.app, s.prefix, &PKCEModel{}, signature)
 	if err != nil {
 		return nil, err
 	}
@@ -284,22 +434,25 @@ func (s *OAuth2Store) GetPKCERequestSession(ctx context.Context, signature strin
 // CreateOpenIDConnectSession implements [openid.OpenIDConnectRequestStorage].
 func (s *OAuth2Store) CreateOpenIDConnectSession(ctx context.Context, authorizeCode string, requester fosite.Requester) error {
 	m := newSessionModel(s.app, &OpenIDConnectSessionModel{})
+	m.Set("provider_prefix", s.prefix)
 	m.SetSignature(authorizeCode)
-	m.SetRequester(requester, fosite.IDToken)
+	if err := m.SetRequester(requester, fosite.IDToken); err != nil {
+		return err
+	}
 
 	return s.app.Save(m)
 }
 
 // DeleteOpenIDConnectSession implements [openid.OpenIDConnectRequestStorage].
 func (s *OAuth2Store) DeleteOpenIDConnectSession(ctx context.Context, authorizeCode string) error {
-	return deleteSessionModelBySignature(s.app, &OpenIDConnectSessionModel{}, authorizeCode)
+	return deleteSessionModelBySignature(s.app, s.prefix, &OpenIDConnectSessionModel{}, authorizeCode)
 }
 
 // GetOpenIDConnectSession implements [openid.OpenIDConnectRequestStorage].
 func (s *OAuth2Store) GetOpenIDConnectSession(ctx context.Context, authorizeCode string, requester fosite.Requester) (fosite.Requester, error) {
-	m, err := findSessionModelBySignature(s.app, &OpenIDConnectSessionModel{}, authorizeCode)
+	m, err := findSessionModelBySignature(s.app, s.prefix, &OpenIDConnectSessionModel{}, authorizeCode)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, fosite.ErrNotFound) {
 			return nil, fositeopenid.ErrNoSessionFound
 		}
 		return nil, err
@@ -328,69 +481,207 @@ func newSessionModel[T SessionModel](app core.App, m T) T {
 	return m
 }
 
-func findSessionModelBySignature[T SessionModel](app core.App, m T, signature string) (T, error) {
+func findSessionModelBySignature[T SessionModel](app core.App, prefix string, m T, signature string) (T, error) {
 	c, err := app.FindCachedCollectionByNameOrId(m.GetCollectionName())
 	if err != nil {
 		c = core.NewBaseCollection("@__invalid__")
 	}
 	err = app.RecordQuery(c).
 		AndWhere(dbx.HashExp{"signature": signature}).
+		AndWhere(providerPrefixExp(app, prefix)).
 		One(m)
 	return m, mapRFCErr(err)
 }
 
-func findSessionModelByRequestID[T SessionModel](app core.App, m T, requestID string) (T, error) {
+func deleteSessionModelBySignature[T SessionModel](app core.App, prefix string, m T, signature string) error {
+	m, err := findSessionModelBySignature(app, prefix, m, signature)
+	if err != nil {
+		if errors.Is(err, fosite.ErrNotFound) {
+			return nil // if the session is not found, we can consider it already deleted and return no error
+		} else {
+			return err
+		}
+	}
+	return app.Delete(m.ProxyRecord())
+}
+
+func deleteSessionModelsByRequestID[T SessionModel](app core.App, prefix string, m T, requestID string) error {
 	c, err := app.FindCachedCollectionByNameOrId(m.GetCollectionName())
 	if err != nil {
-		c = core.NewBaseCollection("@__invalid__")
+		return err
 	}
-	err = app.RecordQuery(c).
+	var rows []T
+	if err := app.RecordQuery(c).
 		AndWhere(dbx.HashExp{"request_id": requestID}).
-		One(m)
-	return m, mapRFCErr(err)
-}
-
-func deleteSessionModelBySignature[T SessionModel](app core.App, m T, signature string) error {
-	m, err := findSessionModelBySignature(app, m, signature)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil // if the session is not found, we can consider it already deleted and return no error
-		} else {
+		AndWhere(providerPrefixExp(app, prefix)).All(&rows); err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if err := app.Delete(row.ProxyRecord()); err != nil {
 			return err
 		}
 	}
-	return app.Delete(m.ProxyRecord())
-}
-
-func deleteSessionModelByRequestID[T SessionModel](app core.App, m T, requestID string) error {
-	m, err := findSessionModelByRequestID(app, m, requestID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil // if the session is not found, we can consider it already deleted and return no error
-		} else {
-			return err
-		}
-	}
-	return app.Delete(m.ProxyRecord())
+	return nil
 }
 
 //
 
-func newJTIModel(app core.App, jti string, exp time.Time) error {
+func newJTIModel(app core.App, prefix, jti string, exp time.Time) error {
 	m := NewJTIModel(app)
+	m.Set("provider_prefix", normalizePrefix(prefix))
 	m.Set("jti", jti)
 	m.Set("expires_at", exp.Unix())
 
 	return app.Save(m)
 }
 
-func hasJTIModel(app core.App, jti string) error {
-	if n, err := app.CountRecords(consts.JTICollectionName, dbx.HashExp{"jti": jti}); err != nil {
+func hasJTIModel(app core.App, prefix, jti string) error {
+	c, err := app.FindCachedCollectionByNameOrId(consts.JTICollectionName)
+	if err != nil {
 		return fosite.ErrServerError.WithWrap(err)
-	} else if n > 0 {
+	}
+	var rows []*JTIModel
+	if err := app.RecordQuery(c).AndWhere(dbx.HashExp{"jti": jti}).AndWhere(providerPrefixExp(app, prefix)).All(&rows); err != nil {
+		return fosite.ErrServerError.WithWrap(err)
+	} else if len(rows) > 0 {
 		return fosite.ErrJTIKnown
 	}
 	return nil
+}
+
+//
+
+const missingRefreshTombstoneLifetime = 24 * time.Hour
+
+// commitRefreshTerminalAuthority publishes the provider-scoped request-id
+// tombstone before any fallible refresh-row/access cleanup. The marker is a
+// separate transaction on purpose: cleanup rollback must never roll terminal
+// authority back with it.
+func commitRefreshTerminalAuthority(app core.App, prefix, requestID, familyID string, expiresAt int64) error {
+	if requestID == "" {
+		return errors.New("terminal refresh authority has no request_id")
+	}
+	prefix = normalizePrefix(prefix)
+	minimumExpiry := time.Now().Add(missingRefreshTombstoneLifetime).Unix()
+	if expiresAt < minimumExpiry {
+		expiresAt = minimumExpiry
+	}
+	return app.RunInTransaction(func(txApp core.App) error {
+		artifactFamily, artifactExpiry, _, err := scopedRefreshArtifactAuthority(txApp, prefix, requestID)
+		if err != nil {
+			return err
+		}
+		if familyID != "" && artifactFamily != "" && familyID != artifactFamily {
+			return errors.New("terminal request_id spans multiple refresh families")
+		}
+		if familyID == "" {
+			familyID = artifactFamily
+		}
+		if expiresAt < artifactExpiry {
+			expiresAt = artifactExpiry
+		}
+		record, err := txApp.FindFirstRecordByFilter(
+			consts.RefreshTombstoneCollectionName,
+			"provider_prefix = {:prefix} && request_id = {:request}",
+			dbx.Params{"prefix": prefix, "request": requestID},
+		)
+		if err == nil {
+			existingFamily := record.GetString("family_id")
+			if existingFamily != "" && familyID != "" && existingFamily != familyID {
+				return errors.New("terminal request_id spans multiple refresh families")
+			}
+			if existingFamily == "" && familyID != "" {
+				record.Set("family_id", familyID)
+			}
+			if int64(record.GetInt("expires_at")) < expiresAt {
+				record.Set("expires_at", expiresAt)
+			}
+			return txApp.Save(record)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		collection, err := txApp.FindCachedCollectionByNameOrId(consts.RefreshTombstoneCollectionName)
+		if err != nil {
+			return err
+		}
+		record = core.NewRecord(collection)
+		record.Set("provider_prefix", prefix)
+		record.Set("request_id", requestID)
+		record.Set("family_id", familyID)
+		record.Set("expires_at", expiresAt)
+		return txApp.Save(record)
+	})
+}
+
+func hasRefreshTerminalAuthority(app core.App, prefix, requestID string) (bool, error) {
+	if requestID == "" {
+		return false, nil
+	}
+	_, err := app.FindFirstRecordByFilter(
+		consts.RefreshTombstoneCollectionName,
+		"provider_prefix = {:prefix} && request_id = {:request}",
+		dbx.Params{"prefix": normalizePrefix(prefix), "request": requestID},
+	)
+	if err == nil {
+		// Presence is terminal until the cleanup job physically removes the
+		// expired marker. Treating an expired-but-not-yet-cleaned row as absent
+		// would reopen a root-issuance window between expiry and cron cleanup.
+		return true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, err
+}
+
+// scopedRefreshArtifactAuthority returns the single refresh family, maximum
+// artifact expiry, and total number of refresh/access rows for one provider-
+// scoped request. Tombstones use the count during cleanup: even an expired
+// row whose deletion failed keeps terminal authority alive until the row is
+// physically gone, because direct resource guards authorize by row presence.
+func scopedRefreshArtifactAuthority(app core.App, prefix, requestID string) (familyID string, expiresAt int64, count int, err error) {
+	refreshCollection, err := app.FindCachedCollectionByNameOrId(consts.RefreshCollectionName)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	var rows []*RefreshTokenModel
+	if err := app.RecordQuery(refreshCollection).
+		AndWhere(dbx.HashExp{"request_id": requestID}).
+		AndWhere(providerPrefixExp(app, prefix)).
+		All(&rows); err != nil {
+		return "", 0, 0, err
+	}
+	for _, row := range rows {
+		count++
+		if candidate := row.GetFamilyID(); candidate != "" {
+			if familyID != "" && familyID != candidate {
+				return "", 0, 0, errors.New("request_id spans multiple refresh families")
+			}
+			familyID = candidate
+		}
+		if expiry := row.GetExpiresAt(); expiry != nil && expiry.Unix() > expiresAt {
+			expiresAt = expiry.Unix()
+		}
+	}
+	accessCollection, err := app.FindCachedCollectionByNameOrId(consts.AccessCollectionName)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	var accessRows []*AccessTokenModel
+	if err := app.RecordQuery(accessCollection).
+		AndWhere(dbx.HashExp{"request_id": requestID}).
+		AndWhere(providerPrefixExp(app, prefix)).
+		All(&accessRows); err != nil {
+		return "", 0, 0, err
+	}
+	for _, row := range accessRows {
+		count++
+		if expiry := row.GetExpiresAt(); expiry != nil && expiry.Unix() > expiresAt {
+			expiresAt = expiry.Unix()
+		}
+	}
+	return familyID, expiresAt, count, nil
 }
 
 //
@@ -414,17 +705,30 @@ func mapRFCErr(err error) error {
 // zero rows affected and is failed with fosite.ErrSerializationFailure
 // so the upstream refresh-grant handler aborts before
 // CreateRefreshTokenSession mints a sibling child.
-func markRefreshRotated(app core.App, signature string) error {
+func markRefreshRotated(app core.App, prefix, requestID, signature string) error {
+	terminal, err := hasRefreshTerminalAuthority(app, prefix, requestID)
+	if err != nil {
+		return fosite.ErrServerError.WithWrap(err).WithDebug("failed to read terminal refresh-family authority before rotation")
+	}
+	if terminal {
+		return fosite.ErrInactiveToken
+	}
 	rotatedAt := time.Now().UnixMicro()
+	prefix = normalizePrefix(prefix)
+	prefixClause := "[[provider_prefix]] = {:prefix}"
+	if legacyDefaultAllowed(app, prefix) {
+		prefixClause = "([[provider_prefix]] = {:prefix} OR [[provider_prefix]] = '')"
+	}
 	result, err := app.DB().NewQuery(
-		"UPDATE {{"+consts.RefreshCollectionName+"}} "+
-			"SET [[status]] = {:rotated}, [[rotated_at]] = {:at} "+
-			"WHERE [[signature]] = {:sig} AND [[status]] = {:active}").
+		"UPDATE {{" + consts.RefreshCollectionName + "}} " +
+			"SET [[status]] = {:rotated}, [[rotated_at]] = {:at} " +
+			"WHERE [[signature]] = {:sig} AND [[status]] = {:active} AND " + prefixClause).
 		Bind(dbx.Params{
 			"rotated": RefreshStatusRotated,
 			"at":      rotatedAt,
 			"sig":     signature,
 			"active":  RefreshStatusActive,
+			"prefix":  prefix,
 		}).Execute()
 	if err != nil {
 		return err
@@ -440,72 +744,253 @@ func markRefreshRotated(app core.App, signature string) error {
 	// Zero rows affected: either the row never existed, or some other
 	// caller already moved it out of "active". Disambiguate by reading
 	// the current state.
-	m, lookupErr := findSessionModelBySignature(app, &RefreshTokenModel{}, signature)
+	m, lookupErr := findSessionModelBySignature(app, prefix, &RefreshTokenModel{}, signature)
 	if lookupErr != nil {
 		if errors.Is(lookupErr, fosite.ErrNotFound) {
-			// Predecessor never existed - preserve the old idempotent
-			// behavior of this function for missing rows.
-			return nil
+			// The token was valid at the earlier read but disappeared before
+			// Rotate. This is never idempotent success: commit a request-scoped
+			// tombstone so even a misbehaving paused caller cannot mint a root.
+			if err := commitRefreshTerminalAuthority(app, prefix, requestID, "", 0); err != nil {
+				return fosite.ErrServerError.WithWrap(err).WithDebug("failed to tombstone missing refresh predecessor")
+			}
+			return fosite.ErrInactiveToken
 		}
 		return lookupErr
+	}
+	expiresAt := int64(0)
+	if expiry := m.GetExpiresAt(); expiry != nil {
+		expiresAt = expiry.Unix()
+	}
+	commitTerminal := func(debug string) error {
+		if err := commitRefreshTerminalAuthority(app, prefix, requestID, m.GetFamilyID(), expiresAt); err != nil {
+			return fosite.ErrServerError.WithWrap(err).WithDebug(debug)
+		}
+		return nil
 	}
 
 	switch m.GetStatus() {
 	case RefreshStatusRotated:
-		// Race lost: a concurrent worker already rotated this token.
-		// Fail so the upstream handler does NOT proceed to mint another
-		// child refresh against the same predecessor.
-		return fosite.ErrSerializationFailure.WithDebug(
-			"refresh token already rotated by a concurrent request")
+		// Race lost: using an already-rotated token is a reuse signal, not a
+		// harmless serialization retry. Tombstone the whole family before
+		// returning so the winner cannot mint (or retain) a replacement in
+		// the Rotate -> Create gap.
+		if err := commitTerminal("failed to commit concurrently reused refresh-family authority"); err != nil {
+			return err
+		}
+		familyID := m.GetFamilyID()
+		if familyID == "" {
+			if err := invalidateLegacyRefreshRow(app, prefix, m); err != nil {
+				return fosite.ErrServerError.WithWrap(err).WithDebug("failed to invalidate concurrently reused legacy refresh token")
+			}
+		} else if err := invalidateRefreshFamily(app, prefix, familyID); err != nil {
+			return fosite.ErrServerError.WithWrap(err).WithDebug("failed to invalidate concurrently reused refresh family")
+		}
+		return fosite.ErrInactiveToken
 	case RefreshStatusReused, RefreshStatusRevoked:
 		// The row was invalidated out from under us (reuse detection or
 		// explicit revocation). Treat as inactive.
+		if err := commitTerminal("failed to commit existing terminal refresh-family authority"); err != nil {
+			return err
+		}
 		return fosite.ErrInactiveToken
 	default:
 		// Unknown state - be conservative and abort the rotation.
+		if err := commitTerminal("failed to tombstone invalid refresh-family state"); err != nil {
+			return err
+		}
 		return fosite.ErrInactiveToken
 	}
 }
 
-// invalidateRefreshFamily marks every refresh row in the given family as
-// reused (status=reused, reused_at=now) and deletes every access token
-// whose request_id matches any row in the family. Best-effort: per-row
-// failures are not propagated so a single bad record cannot mask a
-// reuse signal for the rest of the chain.
-func invalidateRefreshFamily(app core.App, familyID string) error {
-	if familyID == "" {
+// assertRefreshFamilyAllowsAccess prevents an access row created in Fosite's
+// Rotate -> CreateAccess -> CreateRefresh gap from becoming usable after a
+// concurrent reuse or explicit revocation won family authority. Access-only
+// grants have no refresh rows and remain unaffected.
+func assertRefreshFamilyAllowsAccess(app core.App, prefix, requestID string) error {
+	if requestID == "" {
 		return nil
+	}
+	terminal, err := hasRefreshTerminalAuthority(app, prefix, requestID)
+	if err != nil {
+		return fosite.ErrServerError.WithWrap(err)
+	}
+	if terminal {
+		return fosite.ErrInactiveToken
 	}
 	c, err := app.FindCachedCollectionByNameOrId(consts.RefreshCollectionName)
 	if err != nil {
-		return err
+		return fosite.ErrServerError.WithWrap(err)
 	}
 	var rows []*RefreshTokenModel
 	if err := app.RecordQuery(c).
-		AndWhere(dbx.HashExp{"family_id": familyID}).
+		AndWhere(dbx.HashExp{"request_id": requestID}).
+		AndWhere(providerPrefixExp(app, prefix)).
 		All(&rows); err != nil {
-		return err
+		return fosite.ErrServerError.WithWrap(err)
 	}
-
-	now := time.Now().UnixMicro()
-	seenRequestIDs := map[string]struct{}{}
 	for _, row := range rows {
-		if reqID := row.GetRequestID(); reqID != "" {
-			seenRequestIDs[reqID] = struct{}{}
+		switch row.GetStatus() {
+		case RefreshStatusActive, RefreshStatusRotated:
+			// A normal family contains rotated ancestors and one active leaf.
+		case RefreshStatusReused, RefreshStatusRevoked:
+			return fosite.ErrInactiveToken
+		default:
+			return fosite.ErrServerError.WithDebug("refresh-family row has an invalid status")
 		}
-		if row.GetStatus() == RefreshStatusReused {
-			continue
-		}
-		row.SetStatus(RefreshStatusReused)
-		if row.GetReusedAt() == 0 {
-			row.SetReusedAt(now)
-		}
-		_ = app.Save(row.ProxyRecord())
 	}
-
-	for reqID := range seenRequestIDs {
-		_ = deleteSessionModelByRequestID(app, &AccessTokenModel{}, reqID)
-	}
-
 	return nil
+}
+
+// invalidateRefreshFamily marks every refresh row in the given family as
+// reused (status=reused, reused_at=now) and deletes every access token
+// whose request_id matches any row in the family. The entire mutation is
+// transactional and every save/delete error is
+// propagated; partial invalidation would leave a reusable sibling token.
+func invalidateRefreshFamily(app core.App, prefix, familyID string) error {
+	return mutateRefreshFamily(app, prefix, familyID, RefreshStatusReused)
+}
+
+func invalidateLegacyRefreshRow(app core.App, prefix string, row *RefreshTokenModel) error {
+	allowLegacy := legacyDefaultAllowed(app, prefix)
+	return app.RunInTransaction(func(txApp core.App) error {
+		c, err := txApp.FindCachedCollectionByNameOrId(consts.RefreshCollectionName)
+		if err != nil {
+			return err
+		}
+		current := &RefreshTokenModel{}
+		if err := txApp.RecordQuery(c).AndWhere(dbx.HashExp{"id": row.GetID()}).
+			AndWhere(providerPrefixExpWithLegacy(prefix, allowLegacy)).One(current); err != nil {
+			return err
+		}
+		current.SetStatus(RefreshStatusReused)
+		if current.GetReusedAt() == 0 {
+			current.SetReusedAt(time.Now().UnixMicro())
+		}
+		if err := txApp.Save(current.ProxyRecord()); err != nil {
+			return err
+		}
+		accessCollection, err := txApp.FindCachedCollectionByNameOrId(consts.AccessCollectionName)
+		if err != nil {
+			return err
+		}
+		var accessRows []*AccessTokenModel
+		if err := txApp.RecordQuery(accessCollection).AndWhere(dbx.HashExp{"request_id": current.GetRequestID()}).
+			AndWhere(providerPrefixExpWithLegacy(prefix, allowLegacy)).All(&accessRows); err != nil {
+			return err
+		}
+		for _, access := range accessRows {
+			if err := txApp.Delete(access.ProxyRecord()); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func mutateRefreshFamily(app core.App, prefix, familyID, status string) error {
+	if familyID == "" {
+		return nil
+	}
+	allowLegacy := legacyDefaultAllowed(app, prefix)
+	return app.RunInTransaction(func(txApp core.App) error {
+		c, err := txApp.FindCachedCollectionByNameOrId(consts.RefreshCollectionName)
+		if err != nil {
+			return err
+		}
+		var rows []*RefreshTokenModel
+		if err := txApp.RecordQuery(c).AndWhere(dbx.HashExp{"family_id": familyID}).
+			AndWhere(providerPrefixExpWithLegacy(prefix, allowLegacy)).All(&rows); err != nil {
+			return err
+		}
+		now := time.Now().UnixMicro()
+		seenRequestIDs := map[string]struct{}{}
+		for _, row := range rows {
+			if reqID := row.GetRequestID(); reqID != "" {
+				seenRequestIDs[reqID] = struct{}{}
+			}
+			row.SetStatus(status)
+			if status == RefreshStatusReused && row.GetReusedAt() == 0 {
+				row.SetReusedAt(now)
+			}
+			if err := txApp.Save(row.ProxyRecord()); err != nil {
+				return err
+			}
+		}
+		accessCollection, err := txApp.FindCachedCollectionByNameOrId(consts.AccessCollectionName)
+		if err != nil {
+			return err
+		}
+		for reqID := range seenRequestIDs {
+			var accessRows []*AccessTokenModel
+			if err := txApp.RecordQuery(accessCollection).AndWhere(dbx.HashExp{"request_id": reqID}).
+				AndWhere(providerPrefixExpWithLegacy(prefix, allowLegacy)).All(&accessRows); err != nil {
+				return err
+			}
+			for _, access := range accessRows {
+				if err := txApp.Delete(access.ProxyRecord()); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func revokeRefreshFamilyByRequestID(app core.App, prefix, requestID string) error {
+	allowLegacy := legacyDefaultAllowed(app, prefix)
+	return app.RunInTransaction(func(txApp core.App) error {
+		refreshCollection, err := txApp.FindCachedCollectionByNameOrId(consts.RefreshCollectionName)
+		if err != nil {
+			return err
+		}
+		var seeds []*RefreshTokenModel
+		if err := txApp.RecordQuery(refreshCollection).AndWhere(dbx.HashExp{"request_id": requestID}).
+			AndWhere(providerPrefixExpWithLegacy(prefix, allowLegacy)).All(&seeds); err != nil {
+			return err
+		}
+		if len(seeds) == 0 {
+			return nil
+		}
+		families := map[string]struct{}{}
+		for _, row := range seeds {
+			if row.GetFamilyID() == "" {
+				return errors.New("refresh row has no family_id")
+			}
+			families[row.GetFamilyID()] = struct{}{}
+		}
+		seenRequestIDs := map[string]struct{}{}
+		for familyID := range families {
+			var familyRows []*RefreshTokenModel
+			if err := txApp.RecordQuery(refreshCollection).AndWhere(dbx.HashExp{"family_id": familyID}).
+				AndWhere(providerPrefixExpWithLegacy(prefix, allowLegacy)).All(&familyRows); err != nil {
+				return err
+			}
+			for _, row := range familyRows {
+				if reqID := row.GetRequestID(); reqID != "" {
+					seenRequestIDs[reqID] = struct{}{}
+				}
+				row.SetStatus(RefreshStatusRevoked)
+				if err := txApp.Save(row.ProxyRecord()); err != nil {
+					return err
+				}
+			}
+		}
+		accessCollection, err := txApp.FindCachedCollectionByNameOrId(consts.AccessCollectionName)
+		if err != nil {
+			return err
+		}
+		for reqID := range seenRequestIDs {
+			var accessRows []*AccessTokenModel
+			if err := txApp.RecordQuery(accessCollection).AndWhere(dbx.HashExp{"request_id": reqID}).
+				AndWhere(providerPrefixExpWithLegacy(prefix, allowLegacy)).All(&accessRows); err != nil {
+				return err
+			}
+			for _, access := range accessRows {
+				if err := txApp.Delete(access.ProxyRecord()); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
 }

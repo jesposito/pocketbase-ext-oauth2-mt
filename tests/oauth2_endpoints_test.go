@@ -213,12 +213,14 @@ func TestUserInfoEndpoint_WithAuth(t *testing.T) {
 	scenario.BeforeTestFunc = func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
 		seedUsersCollection(t, app)
 		user := seedTestUser(t, app)
+		seedTestClient(t, app)
 		token, err := user.NewAuthToken()
 		if err != nil {
 			t.Fatalf("failed to generate auth token: %v", err)
 		}
+		seedAccessTokenRow(t, app, token, "openid")
 		scenario.Headers = map[string]string{
-			"Authorization": token,
+			"Authorization": "Bearer " + token,
 		}
 	}
 
@@ -405,9 +407,9 @@ func TestRegister_RequiresIAT_When_Configured(t *testing.T) {
 				ScopeStrategy:            fosite.ExactScopeStrategy,
 				AudienceMatchingStrategy: fosite.DefaultAudienceMatchingStrategy,
 			},
-			PathPrefix:                                   "/oauth2",
-			UserCollection:                               testUserCollection,
-			EnableRFC7591DynamicClientRegistration:       true,
+			PathPrefix:                             "/oauth2",
+			UserCollection:                         testUserCollection,
+			EnableRFC7591DynamicClientRegistration: true,
 			DynamicClientRegistrationInitialAccessTokens: []string{iat},
 		}); err != nil {
 			testApp.Cleanup()
@@ -471,10 +473,10 @@ func TestRegister_RequiresIAT_When_Configured(t *testing.T) {
 // TestRegister_RejectsUnsafeRedirectURIs locks in the redirect-URI policy.
 func TestRegister_RejectsUnsafeRedirectURIs(t *testing.T) {
 	cases := []struct {
-		name       string
-		uri        string
-		ok         bool
-		bodyMatch  string
+		name      string
+		uri       string
+		ok        bool
+		bodyMatch string
 	}{
 		{"https_ok", "https://rp.example.com/cb", true, "client_id"},
 		{"loopback_http_ok", "http://localhost:8080/cb", true, "client_id"},
@@ -711,13 +713,13 @@ func dispatchRequest(t *testing.T, app *tests.TestApp, rec *httptest.ResponseRec
 
 // TestLoginInteractionFlow covers the lr7 + mci redesign end-to-end:
 //
-//   1. /auth (unauth) redirects to /login?interaction_id=X
-//   2. /login/state returns the interaction metadata
-//   3. /login/complete decision=deny → access_denied + iss to CLIENT
-//      redirect_uri (NOT a browser-supplied URI)
-//   4. /login/complete approve + missing consent → consent_required
-//   5. /login/complete approve + full consent → code in CLIENT redirect
-//   6. interaction row is consumed (replay returns 404)
+//  1. /auth (unauth) redirects to /login?interaction_id=X
+//  2. /login/state returns the interaction metadata
+//  3. /login/complete decision=deny → access_denied + iss to CLIENT
+//     redirect_uri (NOT a browser-supplied URI)
+//  4. /login/complete approve + missing consent → consent_required
+//  5. /login/complete approve + full consent → code in CLIENT redirect
+//  6. interaction row is consumed (replay returns 404)
 func TestLoginInteractionFlow(t *testing.T) {
 	app := setupTestApp(t)
 	defer app.Cleanup()

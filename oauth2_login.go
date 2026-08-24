@@ -24,11 +24,11 @@ var urlParse = url.Parse
 // learn what consent screen to render — without ever decoding a
 // browser-controlled state blob (lr7).
 type loginStateResponse struct {
-	ClientID           string   `json:"client_id"`
-	ClientName         string   `json:"client_name"`
-	UserCollection     string   `json:"user_collection"`
-	RequestedScopes    []string `json:"requested_scopes"`
-	GrantedScopes      []string `json:"granted_scopes"` // previously consented scopes for this (user not known yet here, so empty) → kept for future
+	ClientID        string   `json:"client_id"`
+	ClientName      string   `json:"client_name"`
+	UserCollection  string   `json:"user_collection"`
+	RequestedScopes []string `json:"requested_scopes"`
+	GrantedScopes   []string `json:"granted_scopes"` // previously consented scopes for this (user not known yet here, so empty) → kept for future
 	// RequestedAcrValues — passed through verbatim from the original
 	// authorize request's acr_values parameter. Consumer's login UI MUST
 	// inspect this list and either satisfy the highest-priority value it
@@ -47,10 +47,10 @@ type loginStateResponse struct {
 // redirect) or surfaces a fosite error redirect — in either case the
 // browser navigates to a server-chosen URL.
 type loginCompleteRequest struct {
-	InteractionID  string   `json:"interaction_id"`
-	PBToken        string   `json:"pb_token"`
-	PBTokenIAT     int64    `json:"pb_token_iat"`
-	Decision       string   `json:"decision"` // "approve" | "deny"
+	InteractionID   string   `json:"interaction_id"`
+	PBToken         string   `json:"pb_token"`
+	PBTokenIAT      int64    `json:"pb_token_iat"`
+	Decision        string   `json:"decision"` // "approve" | "deny"
 	ConsentedScopes []string `json:"consented_scopes"`
 }
 
@@ -83,7 +83,7 @@ func api_OAuth2LoginState(e *core.RequestEvent, inst *Instance) error {
 	if id == "" {
 		return e.BadRequestError("missing interaction id", nil)
 	}
-	in, err := FindInteraction(e.App, id)
+	in, err := FindInteractionAt(e.App, inst.cfg.PathPrefix, id)
 	if err != nil {
 		// Don't leak whether the row never existed vs. expired.
 		return e.NotFoundError("interaction not found or expired", nil)
@@ -104,13 +104,14 @@ func api_OAuth2LoginState(e *core.RequestEvent, inst *Instance) error {
 }
 
 // api_OAuth2LoginComplete finishes a pending interaction. The UI POSTs:
-//   {
-//     "interaction_id": "<uuid>",
-//     "pb_token":      "<PB auth token from PocketBase auth-with-password>",
-//     "pb_token_iat":  <unix seconds the token was issued>,
-//     "decision":      "approve" | "deny",
-//     "consented_scopes": ["openid", "profile", ...]   // only on approve
-//   }
+//
+//	{
+//	  "interaction_id": "<uuid>",
+//	  "pb_token":      "<PB auth token from PocketBase auth-with-password>",
+//	  "pb_token_iat":  <unix seconds the token was issued>,
+//	  "decision":      "approve" | "deny",
+//	  "consented_scopes": ["openid", "profile", ...]   // only on approve
+//	}
 //
 // The server:
 //   - looks up the interaction and rejects if missing/expired,
@@ -149,15 +150,10 @@ func api_OAuth2LoginComplete(e *core.RequestEvent, inst *Instance) error {
 	if req.InteractionID == "" {
 		return e.BadRequestError("interaction_id is required", nil)
 	}
-	in, err := FindInteraction(e.App, req.InteractionID)
+	in, err := ConsumeInteractionAt(e.App, inst.cfg.PathPrefix, req.InteractionID)
 	if err != nil {
 		return e.NotFoundError("interaction not found or expired", nil)
 	}
-	// Always consume the interaction — even if validation fails below the
-	// row should not be reusable. Defer the delete so it runs on every
-	// code path.
-	defer func() { _ = DeleteInteraction(e.App, in.ID) }()
-
 	// Reconstruct the original authorize request from server-stored
 	// form values, NOT from request input. The browser's only influence
 	// on the OAuth flow at this point is decision + consented_scopes +
@@ -191,7 +187,7 @@ func api_OAuth2LoginComplete(e *core.RequestEvent, inst *Instance) error {
 	// Consent enforcement (mci). Merge any previously-recorded consent
 	// with the newly-clicked one; the request can only authorize scopes
 	// the user explicitly approved this round AND/OR previously granted.
-	prior, err := FindConsent(e.App, u.Id, u.Collection().Name, in.ClientID)
+	prior, err := FindConsentAt(e.App, inst.cfg.PathPrefix, u.Id, u.Collection().Name, in.ClientID)
 	if err != nil {
 		e.App.Logger().Warn("[Plugin/OAuth2] FindConsent failed", slog.Any("err", err))
 	}
@@ -203,7 +199,7 @@ func api_OAuth2LoginComplete(e *core.RequestEvent, inst *Instance) error {
 		return writeInteractionError(ctx, e, inst, form, in.RedirectURI, fosite.ErrConsentRequired)
 	}
 	// Record the merged consent for next time (prompt=none silent reuse).
-	if _, cerr := UpsertConsent(e.App, u.Id, u.Collection().Name, in.ClientID, available); cerr != nil {
+	if _, cerr := UpsertConsentAt(e.App, inst.cfg.PathPrefix, u.Id, u.Collection().Name, in.ClientID, available); cerr != nil {
 		e.App.Logger().Warn("[Plugin/OAuth2] UpsertConsent failed (continuing)", slog.Any("err", cerr))
 	}
 
@@ -232,6 +228,7 @@ func api_OAuth2LoginComplete(e *core.RequestEvent, inst *Instance) error {
 	}
 
 	mySessionData := NewSession(e.App, u.Id, u.Collection().Id)
+	mySessionData.Claims.Issuer = providerIssuer(e.App, inst.cfg)
 	mySessionData.Claims.AuthTime = time.Unix(req.PBTokenIAT, 0).UTC()
 	mySessionData.Claims.RequestedAt = in.RequestedAt
 
@@ -254,7 +251,7 @@ func api_OAuth2LoginComplete(e *core.RequestEvent, inst *Instance) error {
 	if err != nil {
 		return writeInteractionError(ctx, e, inst, form, in.RedirectURI, err)
 	}
-	response.AddParameter("iss", e.App.Settings().Meta.AppURL)
+	response.AddParameter("iss", providerIssuer(e.App, inst.cfg))
 
 	// Instead of writing the redirect directly, we capture it and hand
 	// the URL back to the UI as JSON. The browser will then navigate —
@@ -288,7 +285,7 @@ func writeInteractionError(ctx context.Context, e *core.RequestEvent, inst *Inst
 		_ = json.NewEncoder(e.Response).Encode(rfcerr)
 		return nil
 	}
-	iss := e.App.Settings().Meta.AppURL
+	iss := providerIssuer(e.App, inst.cfg)
 	rfcerr := fosite.ErrorToRFC6749Error(oerr).
 		WithLegacyFormat(inst.cfg.BaseConfig.GetUseLegacyErrorFormat(ctx)).
 		WithExposeDebug(inst.cfg.BaseConfig.GetSendDebugMessagesToClients(ctx))
@@ -342,7 +339,7 @@ type captureResponseWriter struct {
 	body   []byte
 }
 
-func (c *captureResponseWriter) Header() http.Header { return c.header }
+func (c *captureResponseWriter) Header() http.Header    { return c.header }
 func (c *captureResponseWriter) WriteHeader(status int) { c.status = status }
 func (c *captureResponseWriter) Write(b []byte) (int, error) {
 	c.body = append(c.body, b...)

@@ -123,9 +123,10 @@ func writeWWWAuthenticate(e *core.RequestEvent, status int, challenge string) {
 	e.Response.WriteHeader(status)
 }
 
-// RevokedTokenGuard returns a router middleware that rejects bearer
-// tokens which have no corresponding _oauth2Access row — i.e. tokens
-// that were revoked via /oauth2/revoke or expired by the cleanup cron.
+// RevokedTokenGuard returns a router middleware that rejects bearer tokens
+// which have no corresponding _oauth2Access row or whose request is covered
+// by durable refresh-family terminal authority — i.e. tokens revoked via
+// /oauth2/revoke even when best-effort access-row cleanup failed.
 //
 // PocketBase native auth tokens are stateless JWTs validated against the
 // PB signing secret; a revoked OAuth2 access token remains a syntactically
@@ -142,6 +143,13 @@ func writeWWWAuthenticate(e *core.RequestEvent, status int, challenge string) {
 // and would also be rejected by this middleware — by design. Use it only
 // on routes that should accept ONLY OAuth-issued tokens.
 func RevokedTokenGuard(app core.App) *hook.Handler[*core.RequestEvent] {
+	return RevokedTokenGuardAt(app, DefaultPathPrefix)
+}
+
+// RevokedTokenGuardAt is the provider-scoped variant for applications that
+// host more than one OAuth provider in a single PocketBase app.
+func RevokedTokenGuardAt(app core.App, prefix string) *hook.Handler[*core.RequestEvent] {
+	prefix = normalizePrefix(prefix)
 	return &hook.Handler[*core.RequestEvent]{
 		Func: func(e *core.RequestEvent) error {
 			token := bearerTokenFromHeader(e.Request.Header.Get("Authorization"))
@@ -157,7 +165,8 @@ func RevokedTokenGuard(app core.App) *hook.Handler[*core.RequestEvent] {
 				return nil
 			}
 			signature := parts[2]
-			if _, err := findSessionModelBySignature(app, &AccessTokenModel{}, signature); err != nil {
+			row, err := findSessionModelBySignature(app, prefix, &AccessTokenModel{}, signature)
+			if err != nil {
 				if errors.Is(err, fosite.ErrNotFound) {
 					writeWWWAuthenticate(e, http.StatusUnauthorized,
 						`Bearer realm="OAuth", error="invalid_token", error_description="The access token has been revoked or expired."`)
@@ -165,6 +174,11 @@ func RevokedTokenGuard(app core.App) *hook.Handler[*core.RequestEvent] {
 				}
 				writeWWWAuthenticate(e, http.StatusUnauthorized,
 					`Bearer realm="OAuth", error="invalid_token", error_description="Failed to validate access token."`)
+				return nil
+			}
+			if err := assertRefreshFamilyAllowsAccess(app, prefix, row.GetRequestID()); err != nil {
+				writeWWWAuthenticate(e, http.StatusUnauthorized,
+					`Bearer realm="OAuth", error="invalid_token", error_description="The access token has been revoked or expired."`)
 				return nil
 			}
 			return e.Next()

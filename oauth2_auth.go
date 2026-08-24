@@ -96,7 +96,7 @@ func api_OAuth2Authorize(e *core.RequestEvent, inst *Instance) error {
 	formCopy := cloneForm(ar.GetRequestForm())
 	formCopy.Del("pb_token")
 	formCopy.Del("pb_token_iat")
-	interactionID, ierr := CreateInteraction(e.App, &Interaction{
+	interactionID, ierr := CreateInteractionAt(e.App, inst.cfg.PathPrefix, &Interaction{
 		ClientID:           c.ID,
 		ClientName:         c.Name,
 		UserCollection:     inst.cfg.UserCollection,
@@ -150,7 +150,7 @@ func parseAcrValues(raw string) []string {
 // fosite's logic on major version bumps.
 func writeAuthorizeErrorWithIss(ctx context.Context, e *core.RequestEvent, inst *Instance, ar fosite.AuthorizeRequester, oerr error) {
 	rw := e.Response
-	iss := e.App.Settings().Meta.AppURL
+	iss := providerIssuer(e.App, inst.cfg)
 	cfg := inst.cfg.BaseConfig
 
 	rw.Header().Set("Cache-Control", "no-store")
