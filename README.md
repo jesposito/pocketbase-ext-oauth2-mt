@@ -127,6 +127,34 @@ All OAuth2 endpoints are served under the configured `PathPrefix` (default `/oau
 | GET/POST | `/oauth2/userinfo` | OpenID Connect UserInfo |
 | POST | `/oauth2/register` | Dynamic client registration (RFC 7591, optional) |
 | GET/POST | `/oauth2/login` | Built-in login/consent UI |
+| GET | `/oauth2/runtime-attestation?nonce=<32-byte-base64url>` | Optional constrained runtime attestation (when `RuntimeAttestationSnapshot` is configured) |
+
+### Constrained runtime attestation
+
+`Config.RuntimeAttestationSnapshot` is a typed callback for applications that
+must bind deployment evidence to the provider's existing OIDC trust root. The
+plugin, not the callback, owns `GET <PathPrefix>/runtime-attestation`, the exact
+claim schema (including the configured `UserCollection`), RS256 key selection,
+protected header, audience `urn:facetcloud:oauth-runtime-attestation:v1`, type
+`facet-oauth-runtime-attestation+jwt`, 60-second lifetime, nonce validation,
+no-store response, and a 120-request-per-minute budget owned by each provider
+instance/prefix. The budget deliberately has no IP or forwarded-header identity,
+so callers sharing Caddy, Traefik, NAT, or another ingress are not collapsed into
+a six-request bucket and forged proxy headers cannot create new buckets.
+The callback can supply only tenant, release/source SHA, source/boot identity,
+and a public auth-configuration digest. It cannot sign arbitrary bytes, choose
+a key, add JOSE headers, change expiry, or obtain a private key/JWK.
+
+There is intentionally no package-global mutable limiter: `core.App` tenants and
+provider prefixes cannot exhaust one another's in-process budget. A host that
+needs a process-wide CPU ceiling must enforce it outside the plugin (for example
+with worker/container limits or an ingress-wide request budget). That boundary
+does not expose signing authority or key material to the host.
+
+Multi-provider applications must request and verify one attestation from every
+required prefix against independently enrolled `(origin, issuer, prefix, kid,
+RFC 7638 thumbprint)` pins. Never accept a key merely because it appears in the
+same target's current JWKS response; fail closed on unknown or rotated keys.
 
 ### Discovery & Metadata
 
