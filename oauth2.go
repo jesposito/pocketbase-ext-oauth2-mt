@@ -96,6 +96,13 @@ type Config struct {
 	// validate the destination — the consumer is trusted to point at a
 	// page it controls.
 	LoginRedirectURL string
+
+	// RuntimeAttestationSnapshot supplies the narrow, public runtime state
+	// signed by GET <PathPrefix>/runtime-attestation. The plugin owns the
+	// route, claim schema, key selection, JOSE headers, nonce validation, TTL,
+	// and rate limit; consumers cannot use the OIDC key as a generic signer.
+	// Nil leaves the endpoint unbound.
+	RuntimeAttestationSnapshot func(context.Context) (RuntimeAttestationSnapshot, error)
 }
 
 // GetOAuth2Config returns the Config for the OP registered at
@@ -726,6 +733,11 @@ func DeregisterAt(app core.App, prefix string) {
 
 func bindOAuth2Handlers(inst *Instance, r *router.Router[*core.RequestEvent]) {
 	rg := r.Group(inst.cfg.PathPrefix)
+	if inst.cfg.RuntimeAttestationSnapshot != nil {
+		rg.GET("/runtime-attestation", func(e *core.RequestEvent) error {
+			return apiOAuth2RuntimeAttestation(e, inst)
+		})
+	}
 	rg.GET("/auth", func(e *core.RequestEvent) error { return api_OAuth2Authorize(e, inst) })
 	rg.POST("/auth", func(e *core.RequestEvent) error { return api_OAuth2Authorize(e, inst) })
 	rg.GET("/token", func(e *core.RequestEvent) error { return api_OAuth2Token(e, inst) })

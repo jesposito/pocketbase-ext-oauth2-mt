@@ -59,13 +59,14 @@ func normalizePrefix(prefix string) string {
 // per-prefix store key, a single app can also host multiple OPs at
 // different path prefixes.
 type Instance struct {
-	cfg        *Config
-	store      *OAuth2Store
-	provider   fosite.OAuth2Provider
-	privateKey *jose.JSONWebKey
-	metadata   *openid.OpenIDProviderMetadata
-	protected  map[string]*rfc9728.ProtectedResourceMetadata
-	mu         sync.RWMutex
+	cfg                *Config
+	store              *OAuth2Store
+	provider           fosite.OAuth2Provider
+	privateKey         *jose.JSONWebKey
+	metadata           *openid.OpenIDProviderMetadata
+	protected          map[string]*rfc9728.ProtectedResourceMetadata
+	mu                 sync.RWMutex
+	attestationLimiter runtimeAttestationLimiter
 }
 
 // getInstance looks up the Instance registered at the DefaultPathPrefix.
